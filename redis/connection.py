@@ -73,6 +73,7 @@ from .exceptions import (
     TimeoutError,
 )
 from .himport import HImportRegistry
+from .leak_detection import LeakDetectionConfig, StaleCheckoutInfo, _LeakTracker
 from .maint_notifications import (
     PENDING_PUSH_NOTIFICATIONS_READ_TIMEOUT,
     MaintenanceState,
@@ -3719,8 +3720,16 @@ class ConnectionPool(MaintNotificationsAbstractConnectionPool, ConnectionPoolInt
     cache configuration, so one resolver can serve cache eligibility and cluster routing
     alike. Defaults to the static command metadata this library ships, which the cache
     configuration resolves through on its own. A resolver built from a live ``COMMAND`` reply
-    is a snapshot of the server it was read from, so give each pool its own rather than
-    sharing one across pools on different servers.
+    is a snapshot of the server it was read from, so give each pool its own rather
+    than sharing one across pools on different servers.
+
+    If ``leak_detection`` is a :class:`~redis.leak_detection.LeakDetectionConfig`
+    with ``enabled=True``, the pool tracks when each connection was checked out
+    together with a short call-site summary. Checkouts outstanding past the
+    configured threshold are available through :meth:`stale_checkouts`, can invoke
+    an alert callback once, make pool-exhaustion errors point at the oldest stale
+    checkouts and survive their connection being garbage collected. The feature is
+    off by default and adds no work to the borrow/return path when disabled.
 
     Any additional keyword arguments are passed to the constructor of
     ``connection_class``.
@@ -3783,6 +3792,7 @@ class ConnectionPool(MaintNotificationsAbstractConnectionPool, ConnectionPoolInt
         cache_factory: Optional[CacheFactoryInterface] = None,
         maint_notifications_config: Optional[MaintNotificationsConfig] = None,
         metadata_resolver: Optional[MetadataResolver] = None,
+        leak_detection: Optional[LeakDetectionConfig] = None,
         **connection_kwargs,
     ):
         max_connections = max_connections or 100
@@ -3795,6 +3805,11 @@ class ConnectionPool(MaintNotificationsAbstractConnectionPool, ConnectionPoolInt
         self.cache = None
         self._cache_factory = cache_factory
         self.metadata_resolver = metadata_resolver
+        # Public configuration of stale checkout detection; ``None`` means the
+        # feature was not requested. The tracker itself always exists so the
+        # pool hooks stay branch-free, but short-circuits while disabled.
+        self.leak_detection = leak_detection
+        self._leak_tracker = _LeakTracker(leak_detection)
 
         try:
             supports_maint_notifications = issubclass(
@@ -4002,6 +4017,10 @@ class ConnectionPool(MaintNotificationsAbstractConnectionPool, ConnectionPoolInt
         self._available_connections = []
         self._in_use_connections = set()
 
+        # Reset stale-checkout bookkeeping according to the configured policy
+        # (clear by default, retain as archive when requested).
+        self._leak_tracker.reset()
+
         # this must be the last operation in this method. while reset() is
         # called when holding _fork_lock, other threads in this process
         # can call _checkpid() which compares self.pid and os.getpid() without
@@ -4109,6 +4128,8 @@ class ConnectionPool(MaintNotificationsAbstractConnectionPool, ConnectionPoolInt
                 connection = self.make_connection()
                 is_created = True
             self._in_use_connections.add(connection)
+            if self._leak_tracker.enabled:
+                self._leak_tracker.checkout(connection)
 
         # Record state transition for observability
         pool_name = get_pool_name(self)
@@ -4147,6 +4168,7 @@ class ConnectionPool(MaintNotificationsAbstractConnectionPool, ConnectionPoolInt
                 duration_seconds=time.monotonic() - start_time_created,
             )
 
+        self._dispatch_leak_alerts()
         return connection
 
     def ensure_connection(self, connection: "Connection") -> None:
@@ -4188,7 +4210,14 @@ class ConnectionPool(MaintNotificationsAbstractConnectionPool, ConnectionPoolInt
     def make_connection(self) -> "ConnectionInterface":
         "Create a new connection"
         if self._created_connections >= self.max_connections:
-            raise MaxConnectionsError("Too many connections")
+            self._dispatch_leak_alerts()
+            raise MaxConnectionsError(
+                self._leak_tracker.format_exhaustion_message(
+                    "Too many connections",
+                    capacity=self.max_connections,
+                    in_use=len(self._in_use_connections),
+                )
+            )
 
         kwargs = dict(self.connection_kwargs)
 
@@ -4208,6 +4237,7 @@ class ConnectionPool(MaintNotificationsAbstractConnectionPool, ConnectionPoolInt
     def release(self, connection: "Connection") -> None:
         "Releases the connection back to the pool"
         self._checkpid()
+        checkout_forgotten = False
         with self._lock:
             try:
                 self._in_use_connections.remove(connection)
@@ -4215,6 +4245,9 @@ class ConnectionPool(MaintNotificationsAbstractConnectionPool, ConnectionPoolInt
                 # Gracefully fail when a connection is returned to this pool
                 # that the pool doesn't actually own
                 return
+            checkout_forgotten = True
+            if self._leak_tracker.enabled:
+                self._leak_tracker.release(connection)
 
             if self.owns_connection(connection):
                 if connection.should_reconnect():
@@ -4260,7 +4293,11 @@ class ConnectionPool(MaintNotificationsAbstractConnectionPool, ConnectionPoolInt
                         connection_state=ConnectionState.USED,
                         counter=-1,
                     )
-                return
+        if checkout_forgotten:
+            # Other long-held checkouts may have crossed the threshold while
+            # this one was outstanding; report them outside the pool lock so a
+            # user callback can itself inspect the pool.
+            self._dispatch_leak_alerts()
 
     def owns_connection(self, connection: "Connection") -> int:
         return connection.pid == self.pid
@@ -4288,6 +4325,84 @@ class ConnectionPool(MaintNotificationsAbstractConnectionPool, ConnectionPoolInt
     def close(self) -> None:
         """Close the pool, disconnecting all connections"""
         self.disconnect()
+        # Apply the configured record policy (clear or retain archived).
+        self._leak_tracker.reset()
+
+    def stale_checkouts(
+        self,
+        threshold: Optional[float] = None,
+        include_exempt: bool = False,
+        include_archived: bool = False,
+    ) -> tuple[StaleCheckoutInfo, ...]:
+        """
+        Return checkouts that have been outstanding for longer than
+        ``threshold`` (defaults to the configured leak-detection threshold),
+        oldest first.
+
+        Each item is a :class:`~redis.leak_detection.StaleCheckoutInfo` carrying
+        the checkout age, a connection identifier and the call-site summary
+        captured at checkout. Checkouts of garbage-collected, never-returned
+        connections stay visible. Returns an empty tuple when leak detection is
+        not enabled.
+        """
+        return self._leak_tracker.stale_checkouts(
+            threshold=threshold,
+            include_exempt=include_exempt,
+            include_archived=include_archived,
+        )
+
+    def mark_checkout_exempt(
+        self,
+        connection: "ConnectionInterface",
+        reason: Optional[str] = None,
+    ) -> bool:
+        """
+        Mark the active checkout of ``connection`` as exempt from stale-checkout
+        reporting. Use for legitimate long checkouts such as subscriptions,
+        watched transactions or blocking commands. Returns False when the
+        connection is not currently checked out (or detection is disabled).
+        """
+        return self._leak_tracker.set_exempt(connection, exempt=True, reason=reason)
+
+    def unmark_checkout_exempt(self, connection: "ConnectionInterface") -> bool:
+        """Remove an exemption previously applied to a checkout."""
+        return self._leak_tracker.set_exempt(connection, exempt=False)
+
+    def mark_command_checkout_exempt(
+        self,
+        connection: "ConnectionInterface",
+        command_name: Any,
+    ) -> bool:
+        """
+        Exempt ``connection``'s checkout when ``command_name`` is listed in the
+        leak detection config's ``exempt_commands``.
+        """
+        return self._leak_tracker.apply_command_exemption(connection, command_name)
+
+    def clear_stale_checkout_archive(self) -> None:
+        """Drop checkout records retained by previous resets with archiving."""
+        self._leak_tracker.clear_archive()
+
+    def _dispatch_leak_alerts(self) -> None:
+        """
+        Report checkouts newly crossing the stale threshold. Runs the user
+        callback outside pool locks; callback exceptions are logged and never
+        propagated back into pool operations.
+        """
+        tracker = self._leak_tracker
+        if not tracker.enabled:
+            return
+        for info in tracker.poll_alerts():
+            callback = tracker.config.alert_callback
+            if callback is None:
+                continue
+            try:
+                callback(info)
+            except Exception:
+                logger.exception(
+                    "Leak detection alert callback raised an exception; "
+                    "the connection pool is unaffected"
+                )
 
     def __enter__(self: _CP) -> _CP:
         return self
@@ -4461,6 +4576,10 @@ class BlockingConnectionPool(ConnectionPool):
                     pass
                 self._locked = False
 
+        # Reset stale-checkout bookkeeping according to the configured policy
+        # (clear by default, retain as archive when requested).
+        self._leak_tracker.reset()
+
         # this must be the last operation in this method. while reset() is
         # called when holding _fork_lock, other threads in this process
         # can call _checkpid() which compares self.pid and os.getpid() without
@@ -4553,6 +4672,7 @@ class BlockingConnectionPool(ConnectionPool):
         # Try and get a connection from the pool. If one isn't available within
         # self.timeout then raise a ``ConnectionError``.
         connection = None
+        timeout_error = None
         try:
             if self._in_maintenance:
                 self._lock.acquire()
@@ -4561,25 +4681,33 @@ class BlockingConnectionPool(ConnectionPool):
                 connection = self.pool.get(block=True, timeout=self.timeout)
             except Empty:
                 record_connection_timeout(pool_name=get_pool_name(self))
-                # Note that this is not caught by the redis client and will be
-                # raised unless handled by application code. If you want never to
-                raise ConnectionError("No connection available.")
-
-            # If the ``connection`` is actually ``None`` then that's a cue to make
-            # a new connection to add to the pool.
-            if connection is None:
-                # Start timing for observability
-                start_time_created = time.monotonic()
-                try:
-                    connection = self.make_connection()
-                except BaseException:
-                    # Hand the slot back, or the pool shrinks on every failure.
+                idle_connections = {conn for conn in self.pool.queue if conn}
+                in_use_count = len(self._connections) - len(idle_connections)
+                timeout_error = ConnectionError(
+                    self._leak_tracker.format_exhaustion_message(
+                        "No connection available.",
+                        capacity=self.max_connections,
+                        in_use=in_use_count,
+                        idle=len(idle_connections),
+                        waited=self.timeout,
+                    )
+                )
+            else:
+                # If the ``connection`` is actually ``None`` then that's a cue to
+                # make a new connection to add to the pool.
+                if connection is None:
+                    # Start timing for observability
+                    start_time_created = time.monotonic()
                     try:
-                        self.pool.put_nowait(None)
-                    except Full:
-                        pass
-                    raise
-                is_created = True
+                        connection = self.make_connection()
+                    except BaseException:
+                        # Hand the slot back, or the pool shrinks on every failure.
+                        try:
+                            self.pool.put_nowait(None)
+                        except Full:
+                            pass
+                        raise
+                    is_created = True
         finally:
             if self._locked:
                 try:
@@ -4587,6 +4715,15 @@ class BlockingConnectionPool(ConnectionPool):
                 except Exception:
                     pass
                 self._locked = False
+
+        if timeout_error is not None:
+            # Note that this is not caught by the redis client and will be
+            # raised unless handled by application code. If you want never to
+            self._dispatch_leak_alerts()
+            raise timeout_error
+
+        if self._leak_tracker.enabled:
+            self._leak_tracker.checkout(connection)
 
         # Record state transition for observability
         pool_name = get_pool_name(self)
@@ -4629,6 +4766,7 @@ class BlockingConnectionPool(ConnectionPool):
             duration_seconds=time.monotonic() - start_time_acquired,
         )
 
+        self._dispatch_leak_alerts()
         return connection
 
     def release(self, connection):
@@ -4636,6 +4774,7 @@ class BlockingConnectionPool(ConnectionPool):
         # Make sure we haven't changed process.
         self._checkpid()
 
+        returned = False
         try:
             if self._in_maintenance:
                 self._lock.acquire()
@@ -4647,6 +4786,9 @@ class BlockingConnectionPool(ConnectionPool):
                 # its needed.
                 connection.disconnect()
                 self.pool.put_nowait(None)
+                if self._leak_tracker.enabled:
+                    self._leak_tracker.release(connection)
+                returned = True
                 # Subclasses can override owns_connection() with a comparison
                 # different from local PID ownership. When such a subclass
                 # rejects a connection checked out by this process, stop
@@ -4663,32 +4805,35 @@ class BlockingConnectionPool(ConnectionPool):
                         connection_state=ConnectionState.USED,
                         counter=-1,
                     )
-                return
-            if connection.should_reconnect():
-                if logger.isEnabledFor(logging.DEBUG):
-                    logger.debug(
-                        "Disconnecting released connection marked for reconnect: "
-                        f"{connection}, {connection.extract_connection_details()}"
-                    )
-                connection.disconnect()
-            # Put the connection back into the pool.
-            pool_name = get_pool_name(self)
-            try:
-                self.pool.put_nowait(connection)
+            else:
+                if self._leak_tracker.enabled:
+                    self._leak_tracker.release(connection)
+                returned = True
+                if connection.should_reconnect():
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(
+                            "Disconnecting released connection marked for reconnect: "
+                            f"{connection}, {connection.extract_connection_details()}"
+                        )
+                    connection.disconnect()
+                # Put the connection back into the pool.
+                pool_name = get_pool_name(self)
+                try:
+                    self.pool.put_nowait(connection)
 
-                # Record state transition: USED -> IDLE
-                record_connection_count(
-                    pool_name=pool_name,
-                    connection_state=ConnectionState.USED,
-                    counter=-1,
-                )
-                record_connection_count(
-                    pool_name=pool_name,
-                    connection_state=ConnectionState.IDLE,
-                    counter=1,
-                )
-            except Full:
-                pass
+                    # Record state transition: USED -> IDLE
+                    record_connection_count(
+                        pool_name=pool_name,
+                        connection_state=ConnectionState.USED,
+                        counter=-1,
+                    )
+                    record_connection_count(
+                        pool_name=pool_name,
+                        connection_state=ConnectionState.IDLE,
+                        counter=1,
+                    )
+                except Full:
+                    pass
         finally:
             if self._locked:
                 try:
@@ -4696,6 +4841,9 @@ class BlockingConnectionPool(ConnectionPool):
                 except Exception:
                     pass
                 self._locked = False
+
+        if returned:
+            self._dispatch_leak_alerts()
 
     def disconnect(self, inuse_connections: bool = True):
         """

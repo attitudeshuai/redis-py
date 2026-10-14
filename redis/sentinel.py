@@ -125,6 +125,11 @@ class SentinelConnectionPoolProxy:
             connection_pool = self.connection_pool_ref()
             if connection_pool is not None:
                 connection_pool.disconnect(inuse_connections=False)
+                # Failover replaces the backing master: checkouts registered
+                # against the old master must not carry over to the new one.
+                tracker = getattr(connection_pool, "_leak_tracker", None)
+                if tracker is not None:
+                    tracker.clear()
         return master_address
 
     def rotate_slaves(self):

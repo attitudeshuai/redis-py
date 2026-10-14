@@ -150,6 +150,11 @@ class SentinelConnectionPool(ConnectionPool):
                 # disconnect any idle connections so that they reconnect
                 # to the new master the next time that they are used.
                 await self.disconnect(inuse_connections=False)
+                # Failover replaces the backing master: checkouts registered
+                # against the old master must not carry over to the new one.
+                tracker = getattr(self, "_leak_tracker", None)
+                if tracker is not None:
+                    tracker.clear()
         return master_address
 
     async def rotate_slaves(self) -> AsyncIterator:

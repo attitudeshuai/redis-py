@@ -67,6 +67,11 @@ from redis.exceptions import (
     WatchError,
 )
 from redis.himport import HImportRegistry, parse_himport_set_args
+from redis.leak_detection import (
+    LeakDetectionConfig,
+    pool_mark_checkout_exempt,
+    pool_mark_command_exemption,
+)
 from redis.lock import Lock
 from redis.maint_notifications import (
     MaintNotificationsConfig,
@@ -339,6 +344,7 @@ class Redis(RedisModuleCommands, CoreCommands, SentinelCommands):
         oss_cluster_maint_notifications_handler: OSSMaintNotificationsHandler
         | None = None,
         metadata_resolver: MetadataResolver | None = None,
+        leak_detection: LeakDetectionConfig | None = None,
     ) -> None:
         """
         Initialize a new Redis client.
@@ -414,6 +420,13 @@ class Redis(RedisModuleCommands, CoreCommands, SentinelCommands):
             `DynamicMetadataResolver` built from a live `COMMAND` reply - use it with care,
             because reading that reply relies on a class in the private `redis._parsers`
             package.
+            Argument is ignored when connection_pool is provided - configure it on the pool
+            instead.
+        leak_detection:
+            configures stale checkout (connection leak) detection on the pool - see
+            `redis.leak_detection.LeakDetectionConfig` for details. When enabled the pool
+            records checkout time and call-site context, exposes `stale_checkouts()`, can
+            invoke an alert callback and enriches pool-exhaustion errors.
             Argument is ignored when connection_pool is provided - configure it on the pool
             instead.
         """
@@ -518,6 +531,10 @@ class Redis(RedisModuleCommands, CoreCommands, SentinelCommands):
                             "metadata_resolver": metadata_resolver,
                         }
                     )
+                if leak_detection is not None:
+                    # A named ``ConnectionPool`` parameter, not a connection kwarg, so it
+                    # reaches the pool without also being forwarded to every connection.
+                    kwargs.update({"leak_detection": leak_detection})
                 maint_notifications_enabled = (
                     maint_notifications_config and maint_notifications_config.enabled
                 )
@@ -566,6 +583,12 @@ class Redis(RedisModuleCommands, CoreCommands, SentinelCommands):
         self._single_connection_client = single_connection_client
         if self._single_connection_client:
             self.connection = self.connection_pool.get_connection()
+            # A single-connection client keeps its only connection checked out
+            # for the lifetime of the client; that is a legitimate long
+            # checkout, not a leak.
+            pool_mark_checkout_exempt(
+                self.connection_pool, self.connection, "single_connection_client"
+            )
             self._event_dispatcher.dispatch(
                 AfterSingleConnectionInstantiationEvent(
                     self.connection, ClientType.SYNC, self.single_connection_lock
@@ -907,6 +930,10 @@ class Redis(RedisModuleCommands, CoreCommands, SentinelCommands):
         pool = self.connection_pool
         command_name = args[0]
         conn = self.connection or pool.get_connection()
+        # Commands configured as long-running (e.g. BLPOP, XREAD) must not
+        # be reported as stale checkouts.
+        if self.connection is None:
+            pool_mark_command_exemption(pool, conn, command_name)
 
         # Start timing for observability
         start_time = time.monotonic()
@@ -1065,6 +1092,9 @@ class Monitor:
     def __init__(self, connection_pool):
         self.connection_pool = connection_pool
         self.connection = self.connection_pool.get_connection()
+        # MONITOR streams for as long as the monitor is alive; that is a
+        # legitimate long checkout, not a leak.
+        pool_mark_checkout_exempt(connection_pool, self.connection, "monitor")
 
     def __enter__(self):
         self._start_monitor()
@@ -1250,6 +1280,10 @@ class PubSub:
 
         if self.connection is None:
             self.connection = self.connection_pool.get_connection()
+            # A subscribed connection is a legitimate long-lived checkout;
+            # keep it out of stale-checkout reporting while the pub/sub object
+            # owns it.
+            pool_mark_checkout_exempt(self.connection_pool, self.connection, "pubsub")
             # register a callback that re-subscribes to any channels we
             # were listening to when we were disconnected
             self.connection.register_connect_callback(self.on_connect)
@@ -2005,6 +2039,9 @@ class Pipeline(Redis):
         if not conn:
             conn = self.connection_pool.get_connection()
             self.connection = conn
+            # A WATCHed transaction keeps the connection until MULTI/EXEC or
+            # reset; mark it as a legitimate long checkout.
+            pool_mark_checkout_exempt(self.connection_pool, conn, "transaction")
 
         # Start timing for observability
         start_time = time.monotonic()

@@ -91,6 +91,7 @@ from redis.exceptions import (
     TimeoutError,
 )
 from redis.himport import HImportRegistry
+from redis.leak_detection import LeakDetectionConfig, StaleCheckoutInfo, _LeakTracker
 from redis.maint_notifications import (
     PENDING_PUSH_NOTIFICATIONS_READ_TIMEOUT,
     MaintenanceState,
@@ -2908,6 +2909,15 @@ class ConnectionPool(
     unix sockets.
     :py:class:`~redis.SSLConnection` can be used for SSL enabled connections.
 
+    If ``leak_detection`` is a :class:`~redis.leak_detection.LeakDetectionConfig`
+    with ``enabled=True``, the pool tracks when each connection was checked out
+    together with a short call-site summary. Checkouts outstanding past the
+    configured threshold are available through :meth:`stale_checkouts`, can invoke
+    an alert callback once (scheduled without blocking the event loop), make
+    pool-exhaustion errors point at the oldest stale checkouts and survive their
+    connection being garbage collected. The feature is off by default and adds no
+    work to the borrow/return path when disabled.
+
     Any additional keyword arguments are passed to the constructor of
     ``connection_class``.
     """
@@ -2965,6 +2975,7 @@ class ConnectionPool(
         connection_class: Type[AbstractConnection] = Connection,
         max_connections: Optional[int] = None,
         maint_notifications_config: MaintNotificationsConfig | None = None,
+        leak_detection: Optional[LeakDetectionConfig] = None,
         **connection_kwargs,
     ):
         max_connections = max_connections or 100
@@ -2978,6 +2989,11 @@ class ConnectionPool(
         self.connection_class = connection_class
         self._connection_kwargs = connection_kwargs
         self.max_connections = max_connections
+        # Public configuration of stale checkout detection; ``None`` means the
+        # feature was not requested. The tracker itself always exists so the
+        # pool hooks stay branch-free, but short-circuits while disabled.
+        self.leak_detection = leak_detection
+        self._leak_tracker = _LeakTracker(leak_detection)
 
         # Resolve the HIMPORT registry. A pre-built ``himport_registry`` (shared, e.g.
         # from the cluster client) takes precedence; otherwise build a fresh empty one.
@@ -3089,6 +3105,10 @@ class ConnectionPool(
         self._available_connections = []
         self._in_use_connections = weakref.WeakSet()
 
+        # Reset stale-checkout bookkeeping according to the configured policy
+        # (clear by default, retain as archive when requested).
+        self._leak_tracker.reset()
+
     def __del__(self) -> None:
         """Clean up connection pool and record metrics when garbage collected."""
         try:
@@ -3146,6 +3166,8 @@ class ConnectionPool(
             )
             is_created = connections_after > connections_before
 
+        self._schedule_leak_alerts()
+
         # Record state transition for observability
         # This ensures counters stay balanced if ensure_connection() fails and release() is called
         pool_name = get_pool_name(self)
@@ -3190,9 +3212,17 @@ class ConnectionPool(
             connection = self._available_connections.pop()
         except IndexError:
             if len(self._in_use_connections) >= self.max_connections:
-                raise MaxConnectionsError("Too many connections") from None
+                raise MaxConnectionsError(
+                    self._leak_tracker.format_exhaustion_message(
+                        "Too many connections",
+                        capacity=self.max_connections,
+                        in_use=len(self._in_use_connections),
+                    )
+                ) from None
             connection = self.make_connection()
         self._in_use_connections.add(connection)
+        if self._leak_tracker.enabled:
+            self._leak_tracker.checkout(connection)
         return connection
 
     def get_encoder(self):
@@ -3239,6 +3269,8 @@ class ConnectionPool(
         # not doing so is an error that will cause an exception here.
         async with self._lock:
             self._in_use_connections.remove(connection)
+            if self._leak_tracker.enabled:
+                self._leak_tracker.release(connection)
 
             if connection.should_reconnect():
                 if logger.isEnabledFor(logging.DEBUG):
@@ -3249,6 +3281,8 @@ class ConnectionPool(
                 await connection.disconnect()
 
             self._available_connections.append(connection)
+
+        self._schedule_leak_alerts()
 
         await self._event_dispatcher.dispatch_async(
             AsyncAfterConnectionReleasedEvent(connection)
@@ -3308,6 +3342,98 @@ class ConnectionPool(
         """Close the pool, disconnecting all connections"""
         await self._on_close()
         await self.disconnect()
+        # Apply the configured record policy (clear or retain archived).
+        self._leak_tracker.reset()
+
+    def stale_checkouts(
+        self,
+        threshold: Optional[float] = None,
+        include_exempt: bool = False,
+        include_archived: bool = False,
+    ) -> tuple[StaleCheckoutInfo, ...]:
+        """
+        Return checkouts that have been outstanding for longer than
+        ``threshold`` (defaults to the configured leak-detection threshold),
+        oldest first.
+
+        Each item is a :class:`~redis.leak_detection.StaleCheckoutInfo` carrying
+        the checkout age, a connection identifier and the call-site summary
+        captured at checkout. Checkouts of garbage-collected, never-returned
+        connections stay visible. Returns an empty tuple when leak detection is
+        not enabled.
+        """
+        return self._leak_tracker.stale_checkouts(
+            threshold=threshold,
+            include_exempt=include_exempt,
+            include_archived=include_archived,
+        )
+
+    def mark_checkout_exempt(
+        self,
+        connection: AbstractConnection,
+        reason: Optional[str] = None,
+    ) -> bool:
+        """
+        Mark the active checkout of ``connection`` as exempt from stale-checkout
+        reporting. Use for legitimate long checkouts such as subscriptions,
+        watched transactions or blocking commands. Returns False when the
+        connection is not currently checked out (or detection is disabled).
+        """
+        return self._leak_tracker.set_exempt(connection, exempt=True, reason=reason)
+
+    def unmark_checkout_exempt(self, connection: AbstractConnection) -> bool:
+        """Remove an exemption previously applied to a checkout."""
+        return self._leak_tracker.set_exempt(connection, exempt=False)
+
+    def mark_command_checkout_exempt(
+        self,
+        connection: AbstractConnection,
+        command_name: Any,
+    ) -> bool:
+        """
+        Exempt ``connection``'s checkout when ``command_name`` is listed in the
+        leak detection config's ``exempt_commands``.
+        """
+        return self._leak_tracker.apply_command_exemption(connection, command_name)
+
+    def clear_stale_checkout_archive(self) -> None:
+        """Drop checkout records retained by previous resets with archiving."""
+        self._leak_tracker.clear_archive()
+
+    def _schedule_leak_alerts(self) -> None:
+        """
+        Schedule delivery of newly-stale checkout alerts without blocking the
+        borrow/return path or the event loop. The configured callback is a
+        regular synchronous callable, run once via ``loop.call_soon``; its
+        exceptions are logged and never affect the pool.
+        """
+        tracker = self._leak_tracker
+        if not tracker.enabled:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # No running loop (e.g. pool torn down outside async code): fall
+            # back to running the cheap polling/dispatch inline.
+            self._dispatch_leak_alerts()
+            return
+        loop.call_soon(self._dispatch_leak_alerts)
+
+    def _dispatch_leak_alerts(self) -> None:
+        tracker = self._leak_tracker
+        if not tracker.enabled:
+            return
+        for info in tracker.poll_alerts():
+            callback = tracker.config.alert_callback
+            if callback is None:
+                continue
+            try:
+                callback(info)
+            except Exception:
+                logger.exception(
+                    "Leak detection alert callback raised an exception; "
+                    "the connection pool is unaffected"
+                )
 
     async def __aenter__(self: _CP) -> _CP:
         return self
@@ -3467,7 +3593,18 @@ class BlockingConnectionPool(ConnectionPool):
                         is_created = connections_after > connections_before
         except asyncio.TimeoutError as err:
             await record_connection_timeout(pool_name=get_pool_name(self))
-            raise ConnectionError("No connection available.") from err
+            self._schedule_leak_alerts()
+            raise ConnectionError(
+                self._leak_tracker.format_exhaustion_message(
+                    "No connection available.",
+                    capacity=self.max_connections,
+                    in_use=len(self._in_use_connections),
+                    idle=len(self._available_connections),
+                    waited=time.monotonic() - start_time_acquired,
+                )
+            ) from err
+
+        self._schedule_leak_alerts()
 
         # Record state transition for observability.
         pool_name = get_pool_name(self)

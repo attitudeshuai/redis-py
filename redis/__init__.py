@@ -27,6 +27,7 @@ from redis.keyspace_notifications import (
     SubkeyspaceitemChannel,
     get_channel_type,
 )
+from redis.leak_detection import LeakDetectionConfig, StaleCheckoutInfo
 from redis.exceptions import (
     AuthenticationError,
     AuthenticationWrongNumberOfArgsError,
@@ -95,6 +96,8 @@ __all__ = [
     "KeyspaceNotifications",
     "KeyspaceNotificationsInterface",
     "KeyspaceWorkerThread",
+    "LeakDetectionConfig",
+    "StaleCheckoutInfo",
     "SubkeyeventChannel",
     "SubkeyspaceChannel",
     "SubkeyspaceeventChannel",

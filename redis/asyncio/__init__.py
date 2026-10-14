@@ -36,6 +36,7 @@ from redis.exceptions import (
     TimeoutError,
     WatchError,
 )
+from redis.leak_detection import LeakDetectionConfig, StaleCheckoutInfo
 from redis.typing import Subscription
 
 __all__ = [
@@ -54,6 +55,8 @@ __all__ = [
     "from_url",
     "default_backoff",
     "InvalidResponse",
+    "LeakDetectionConfig",
+    "StaleCheckoutInfo",
     "PubSubError",
     "OutOfMemoryError",
     "ReadOnlyError",
