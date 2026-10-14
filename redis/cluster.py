@@ -40,7 +40,11 @@ from redis.backoff import ExponentialWithJitterBackoff, NoBackoff
 from redis.cache import CacheConfig, CacheFactory, CacheFactoryInterface, CacheInterface
 from redis.client import EMPTY_RESPONSE, CaseInsensitiveDict, PubSub, Redis
 from redis.commands import RedisClusterCommands
-from redis.commands.helpers import list_or_args, parse_pubsub_subscriptions
+from redis.commands.helpers import (
+    list_or_args,
+    parse_pubsub_subscriptions,
+    pubsub_subscription_args,
+)
 from redis.commands.metadata import (
     _DEFAULT_KEYED_METADATA,
     _DEFAULT_KEYLESS_METADATA,
@@ -3495,6 +3499,40 @@ class ClusterPubSub(PubSub):
         for subscriptions in by_slot.values():
             self._resubscribe(subscriptions, self.ssubscribe)
 
+    def _recovery_node_name(self) -> Optional[str]:
+        return self.node.name if self.node is not None else None
+
+    def _recovery_replay_shard(self, connection) -> None:
+        # Shard channels do not live on the cluster-level connection: they
+        # are routed to the per-node pubsub that currently owns each
+        # channel's slot, so their confirmations are read by the shard poll
+        # loops rather than here. Re-route every tracked channel against the
+        # current slot map (the final ownership after any migration) and
+        # account send success; the owning per-node pubsub reports the
+        # confirmed recovery with its node name attached.
+        state = self._recovery
+        kind = state.kind_shard_channel
+        for subscription in pubsub_subscription_args(self.shard_channels):
+            raw_name = (
+                subscription.name
+                if isinstance(subscription, Subscription)
+                else subscription
+            )
+            name = self._recovery_normalize_name(raw_name)
+            try:
+                self.ssubscribe(subscription)
+            except (ConnectionError, TimeoutError, OSError):
+                raise
+            except Exception as exc:
+                reason = str(exc) or type(exc).__name__
+                complete = state.fail(kind, name, reason)
+                if complete:
+                    self._recovery_finalize_if_complete()
+                continue
+            complete = state.resolve(kind, name)
+            if complete:
+                self._recovery_finalize_if_complete()
+
     def _get_node_pubsub(self, node):
         try:
             return self.node_pubsub_mapping[node.name]
@@ -3502,7 +3540,14 @@ class ClusterPubSub(PubSub):
             redis_connection = self.cluster.get_redis_connection(node)
             pubsub = redis_connection.pubsub(
                 push_handler_func=self.push_handler_func,
+                recovery_handler=self._recovery_handler,
             )
+            # Share the cluster pubsub's dispatcher so recovery listeners
+            # registered on it also reach the per-node shard pubsubs.
+            pubsub._event_dispatcher = self._event_dispatcher
+            # Tag shard recovery events with the node the per-node pubsub is
+            # bound to, so shard channels are reported by owning node.
+            pubsub._recovery_node = node.name
             # Replay shard subscriptions on reconnect with slot-aware grouping
             # so that channels spanning multiple slots owned by this node do
             # not trigger a CROSSSLOT error.

@@ -17,10 +17,16 @@ import redis
 from redis import Subscription
 from redis._parsers import Encoder
 from redis.backoff import NoBackoff
-from redis.client import PubSub
+from redis.client import PubSub, _PubSubRecoveryState
 from redis.cluster import ClusterPubSub
 from redis.crc import key_slot
-from redis.event import EventDispatcher
+from redis.event import (
+    ClientType,
+    EventDispatcher,
+    EventListenerInterface,
+    PubSubRecoveryEvent,
+    PubSubRecoveryFailure,
+)
 from redis.exceptions import (
     ConnectionError,
     RedisError,
@@ -4928,3 +4934,331 @@ class _StatefulNodePubSub:
         self.shard_channels.clear()
         self.pending_unsubscribe_shard_channels.clear()
         self.subscribed_event.clear()
+
+
+@pytest.mark.fixed_client
+class TestPubSubRecoveryNotifications:
+    """
+    Deterministic unit tests for the optional pub/sub disconnect-recovery
+    notification. No Redis server required: the connection is fully mocked
+    and a reconnect is driven by calling the registered ``on_connect``
+    callback after opening a recovery window.
+    """
+
+    def _make_pubsub(self, handler=None, event_dispatcher=None):
+        pool = mock.MagicMock()
+        encoder = Encoder("utf-8", "strict", False)
+        pool.get_encoder.return_value = encoder
+
+        conn = mock.MagicMock()
+        conn.host = "localhost"
+        conn.port = 6379
+        conn.db = 0
+        conn.health_check_interval = 0
+        conn.is_connected = True
+        conn.should_reconnect.return_value = False
+
+        def _call_with_retry(do, fail, is_retryable=None, with_failure_count=False):
+            return do()
+
+        conn.retry.call_with_retry.side_effect = _call_with_retry
+        conn.retry.get_retries.return_value = 0
+        pool.get_connection.return_value = conn
+
+        pubsub = PubSub(
+            connection_pool=pool,
+            encoder=encoder,
+            recovery_handler=handler,
+            event_dispatcher=event_dispatcher,
+        )
+        return pubsub, conn
+
+    def test_recovery_event_reports_restored_subscriptions(self):
+        events = []
+        p, conn = self._make_pubsub(events.append)
+        try:
+            p.subscribe(b"ch1")
+            p.psubscribe(b"p1*")
+
+            p._recovery_begin()
+            conn.read_response.side_effect = [
+                [b"subscribe", b"ch1", 1],
+                [b"psubscribe", b"p1*", 1],
+            ]
+            p.on_connect(conn)
+
+            assert len(events) == 1
+            event = events[0]
+            assert event.channels == [b"ch1"]
+            assert event.patterns == [b"p1*"]
+            assert event.shard_channels == []
+            assert event.failures == []
+            assert event.node is None
+            assert event.client_type == ClientType.SYNC
+            assert event.gap_seconds >= 0.0
+            assert event.disconnected_at.tzinfo is not None
+            assert event.recovered_at >= event.disconnected_at
+
+            # The inline-read confirmations are still handed to the listener
+            # through parse_response, in the order they were confirmed.
+            assert p.parse_response(block=False) == [b"subscribe", b"ch1", 1]
+            assert p.parse_response(block=False) == [b"psubscribe", b"p1*", 1]
+        finally:
+            p.close()
+
+    def test_recovery_event_is_per_disconnect_and_not_crossed(self):
+        events = []
+        p, conn = self._make_pubsub(events.append)
+        try:
+            p.subscribe(b"ch1")
+            for _ in range(2):
+                p._recovery_begin()
+                conn.read_response.side_effect = [[b"subscribe", b"ch1", 1]]
+                p.on_connect(conn)
+                assert p.parse_response(block=False) == [b"subscribe", b"ch1", 1]
+            assert len(events) == 2
+            assert events[0] is not events[1]
+            assert events[0].channels == [b"ch1"]
+            assert events[1].channels == [b"ch1"]
+        finally:
+            p.close()
+
+    def test_no_event_without_a_disconnect(self):
+        events = []
+        p, conn = self._make_pubsub(events.append)
+        try:
+            p.subscribe(b"ch1")
+            assert events == []
+            # Reading the ordinary subscribe ack does not open a window.
+            assert p._recovery is None
+        finally:
+            p.close()
+
+    def test_begin_ignored_without_subscriptions(self):
+        events = []
+        p, conn = self._make_pubsub(events.append)
+        try:
+            p._recovery_begin()
+            assert p._recovery is None
+            assert events == []
+        finally:
+            p.close()
+
+    def test_failed_resubscribe_is_reported_but_keeps_siblings(self):
+        events = []
+        p, conn = self._make_pubsub(events.append)
+        try:
+            p.subscribe(b"bad", b"good")
+
+            p._recovery_begin()
+            conn.read_response.side_effect = [
+                ResponseError("ERR rejected by server"),
+                [b"subscribe", b"good", 2],
+            ]
+            p.on_connect(conn)
+
+            assert len(events) == 1
+            event = events[0]
+            assert event.channels == [b"good"]
+            assert len(event.failures) == 1
+            failure = event.failures[0]
+            assert failure.kind == PubSubRecoveryFailure.KIND_CHANNEL
+            assert failure.name == b"bad"
+            assert "rejected by server" in failure.reason
+            # The rejected channel stays tracked, so a later reconnect tries
+            # it again; the sibling was confirmed normally.
+            assert b"bad" in p.channels
+            assert b"good" in p.channels
+            assert p.parse_response(block=False) == [b"subscribe", b"good", 2]
+        finally:
+            p.close()
+
+    def test_connectivity_error_aborts_replay_without_event(self):
+        events = []
+        p, conn = self._make_pubsub(events.append)
+        try:
+            p.subscribe(b"ch1")
+
+            p._recovery_begin()
+            conn.read_response.side_effect = ConnectionError("server gone")
+            with pytest.raises(ConnectionError):
+                p.on_connect(conn)
+
+            # The whole reconnect is retried: no partial event, window left
+            # open for the next pass.
+            assert events == []
+            assert p._recovery is not None
+        finally:
+            p.close()
+
+    def test_subscribe_during_recovery_is_included_once(self):
+        events = []
+        p, conn = self._make_pubsub(events.append)
+        try:
+            p.subscribe(b"old")
+
+            p._recovery_begin()
+            # The caller subscribes a new channel while the window is open;
+            # its confirmation arrives in-band rather than during the replay.
+            p._recovery_track_subscriptions(
+                _PubSubRecoveryState.kind_channel, {b"new": None}
+            )
+            conn.read_response.side_effect = [[b"subscribe", b"old", 1]]
+            p.on_connect(conn)
+            # subscribe() records the channel locally right after the command
+            # (which drove the reconnect above) returns.
+            p.channels[b"new"] = None
+
+            # Not reported yet: "new" is still pending confirmation.
+            assert events == []
+            p._recovery_account_reply([b"subscribe", b"new", 2])
+            assert len(events) == 1
+            assert set(events[0].channels) == {b"old", b"new"}
+            # The replayed ack is delivered once through the message stream.
+            assert p.parse_response(block=False) == [b"subscribe", b"old", 1]
+        finally:
+            p.close()
+
+    def test_pending_unsubscribe_is_excluded_from_recovery(self):
+        events = []
+        p, conn = self._make_pubsub(events.append)
+        try:
+            p.subscribe(b"kept", b"gone")
+            # An unsubscribe was already pending when the connection dropped.
+            p.pending_unsubscribe_channels.add(b"gone")
+
+            p._recovery_begin()
+            conn.read_response.side_effect = [
+                [b"subscribe", b"kept", 2],
+                [b"subscribe", b"gone", 2],
+            ]
+            p.on_connect(conn)
+
+            assert len(events) == 1
+            assert events[0].channels == [b"kept"]
+            assert events[0].failures == []
+        finally:
+            p.close()
+
+    def test_default_off_keeps_batched_resubscribe_and_no_reads(self):
+        p, conn = self._make_pubsub()
+        try:
+            p.subscribe(b"a", b"b")
+            assert p._recovery is None
+
+            p.on_connect(conn)
+
+            # Default behavior is a single batched SUBSCRIBE with no inline
+            # confirmation reads and no event.
+            assert conn.read_response.call_count == 0
+            last_call = conn.send_command.call_args_list[-1]
+            assert last_call.args == ("SUBSCRIBE", b"a", b"b")
+            assert p._recovery is None
+            assert len(p._recovery_queued_responses) == 0
+        finally:
+            p.close()
+
+    def test_dispatcher_listener_enables_notifications(self):
+        received = []
+
+        class Listener(EventListenerInterface):
+            def listen(self, event):
+                received.append(event)
+
+        dispatcher = EventDispatcher()
+        dispatcher.register_listeners({PubSubRecoveryEvent: [Listener()]})
+        p, conn = self._make_pubsub(event_dispatcher=dispatcher)
+        try:
+            p.subscribe(b"ch1")
+            p._recovery_begin()
+            conn.read_response.side_effect = [[b"subscribe", b"ch1", 1]]
+            p.on_connect(conn)
+            assert len(received) == 1
+            assert received[0].channels == [b"ch1"]
+        finally:
+            p.close()
+
+    def test_failing_handler_does_not_break_reconnect(self):
+        def boom(event):
+            raise RuntimeError("handler boom")
+
+        p, conn = self._make_pubsub(boom)
+        try:
+            p.subscribe(b"ch1")
+            p._recovery_begin()
+            conn.read_response.side_effect = [[b"subscribe", b"ch1", 1]]
+            # Must not raise: recovery notifications are report-only.
+            p.on_connect(conn)
+            assert p.parse_response(block=False) == [b"subscribe", b"ch1", 1]
+        finally:
+            p.close()
+
+    def test_recovery_event_reports_shard_channels(self):
+        events = []
+        p, conn = self._make_pubsub(events.append)
+        try:
+            p.ssubscribe(b"sh1")
+            p._recovery_begin()
+            conn.read_response.side_effect = [[b"ssubscribe", b"sh1", 1]]
+            p.on_connect(conn)
+            assert len(events) == 1
+            assert events[0].shard_channels == [b"sh1"]
+            assert events[0].channels == []
+            assert p.parse_response(block=False) == [b"ssubscribe", b"sh1", 1]
+        finally:
+            p.close()
+
+
+@pytest.mark.fixed_client
+def test_cluster_recovery_shard_replay_routes_to_final_owner():
+    """The cluster-level tracked shard replay re-routes every tracked shard
+    channel to the node that owns its slot at recovery time and reports
+    success without reading confirmations here (they belong to the per-node
+    shard poll loops)."""
+    from redis.cluster import ClusterPubSub
+
+    encoder = Encoder("utf-8", "strict", False)
+    pubsub = ClusterPubSub.__new__(ClusterPubSub)
+    pubsub.encoder = encoder
+    pubsub._lock = threading.RLock()
+    pubsub.subscribed_event = threading.Event()
+    pubsub.health_check_response_counter = 0
+    pubsub.connection = None
+    pubsub.node = None
+    pubsub.channels = {}
+    pubsub.pending_unsubscribe_channels = set()
+    pubsub.shard_channels = {b"foo": None}
+    pubsub.pending_unsubscribe_shard_channels = set()
+    pubsub.patterns = {}
+    pubsub.pending_unsubscribe_patterns = set()
+    pubsub.ignore_subscribe_messages = False
+    pubsub.cluster = mock.MagicMock()
+    owner = mock.MagicMock()
+    owner.name = "127.0.0.1:7001"
+    pubsub.cluster.get_node_from_key.return_value = owner
+    node_pubsub = mock.MagicMock()
+    node_pubsub.shard_channels = {b"foo": None}
+    pubsub.node_pubsub_mapping = {owner.name: node_pubsub}
+    pubsub._shard_channel_to_node = {}
+    pubsub._poll_cool_off = weakref.WeakKeyDictionary()
+    pubsub._unreachable_nodes = set()
+    pubsub._next_topology_repair = 0.0
+    pubsub._shard_state_lock = threading.RLock()
+    pubsub.push_handler_func = None
+
+    events = []
+    pubsub._recovery_handler = events.append
+    pubsub._event_dispatcher = EventDispatcher()
+
+    state = _PubSubRecoveryState()
+    state.seed({}, {}, pubsub.shard_channels)
+    pubsub._recovery = state
+
+    pubsub._recovery_replay_shard(connection=None)
+
+    node_pubsub.ssubscribe.assert_called_once_with(b"foo")
+    assert pubsub._shard_channel_to_node == {b"foo": owner.name}
+    assert len(events) == 1
+    event = events[0]
+    assert event.shard_channels == [b"foo"]
+    assert event.failures == []

@@ -13,6 +13,8 @@ from redis.observability.recorder import (
 from redis.utils import check_protocol_version, deprecated_function
 
 if TYPE_CHECKING:
+    import datetime
+
     from redis.maint_notifications import (
         MaintenanceNotification,
         MaintenanceState,
@@ -75,6 +77,18 @@ class EventDispatcherInterface(ABC):
     ):
         """Remove previously registered listeners by identity."""
         pass
+
+    def has_listeners(
+        self, event_type: Type[object], *, is_async: Optional[bool] = None
+    ) -> bool:
+        """Return whether listeners are registered for ``event_type``.
+
+        ``is_async`` filters by listener flavour: ``True`` for
+        :class:`AsyncEventListenerInterface`, ``False`` for
+        :class:`EventListenerInterface`, ``None`` for either. The default
+        implementation assumes no listeners; concrete dispatchers override it.
+        """
+        return False
 
 
 class EventException(Exception):
@@ -188,6 +202,25 @@ class EventDispatcher(EventDispatcherInterface):
                     for listener in current
                     if all(listener is not target for target in to_remove)
                 ]
+
+    def has_listeners(
+        self, event_type: Type[object], *, is_async: Optional[bool] = None
+    ) -> bool:
+        with self._lock:
+            listeners = self._event_listeners_mapping.get(event_type)
+            if not listeners:
+                return False
+            if is_async is None:
+                return True
+            if is_async:
+                return any(
+                    isinstance(listener, AsyncEventListenerInterface)
+                    for listener in listeners
+                )
+            return any(
+                isinstance(listener, EventListenerInterface)
+                for listener in listeners
+            )
 
 
 class AfterConnectionReleasedEvent:
@@ -303,6 +336,160 @@ class MaintenanceCompletedEvent(MaintenanceEvent):
     """
 
     pass
+
+
+class PubSubRecoveryFailure:
+    """
+    A single subscription that could not be restored while a pub/sub
+    connection recovered from a disconnect.
+
+    :param kind: One of ``PubSubRecoveryFailure.KIND_CHANNEL``,
+        ``KIND_PATTERN`` or ``KIND_SHARD_CHANNEL``.
+    :param name: The channel or pattern name as the client tracks it
+        (``bytes`` or ``str`` depending on ``decode_responses``).
+    :param reason: The reason the re-subscription could not be confirmed,
+        taken from the rejecting error. May be ``None`` when the error
+        carried no message.
+    """
+
+    KIND_CHANNEL = "channel"
+    KIND_PATTERN = "pattern"
+    KIND_SHARD_CHANNEL = "shard_channel"
+
+    def __init__(self, kind: str, name: object, reason: Optional[str]):
+        self._kind = kind
+        self._name = name
+        self._reason = reason
+
+    @property
+    def kind(self) -> str:
+        return self._kind
+
+    @property
+    def name(self) -> object:
+        return self._name
+
+    @property
+    def reason(self) -> Optional[str]:
+        return self._reason
+
+    def __repr__(self) -> str:
+        return (
+            f"PubSubRecoveryFailure(kind={self._kind!r}, name={self._name!r},"
+            f" reason={self._reason!r})"
+        )
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, PubSubRecoveryFailure):
+            return NotImplemented
+        return (
+            self._kind == other._kind
+            and self._name == other._name
+            and self._reason == other._reason
+        )
+
+
+class PubSubRecoveryEvent:
+    """
+    Event fired once after a subscribed pub/sub connection that dropped is
+    re-established and every re-subscription attempted for that recovery has
+    been confirmed or reported as failed.
+
+    One event is produced per observed disconnect; back-to-back disconnects
+    produce separate events. No event is fired without a preceding
+    disconnect, and none is fired while recovery notifications are disabled.
+
+    The timing is client-observed only: ``disconnected_at`` /
+    ``recovered_at`` are the client's wall-clock timestamps for the moment it
+    confirmed the drop and the moment re-subscriptions were confirmed, and
+    ``gap_seconds`` is the same interval on a monotonic clock. It describes
+    the window in which this client could not receive messages; it does not
+    imply anything about server-side message retention.
+
+    :param disconnected_at: UTC wall-clock time at which the disconnect was
+        confirmed by the client.
+    :param recovered_at: UTC wall-clock time at which re-subscriptions were
+        confirmed.
+    :param gap_seconds: Monotonic duration of the observed gap.
+    :param channels: Channel names confirmed as re-subscribed.
+    :param patterns: Pattern names confirmed as re-subscribed.
+    :param shard_channels: Shard channel names confirmed as re-subscribed.
+    :param failures: :class:`PubSubRecoveryFailure` entries for subscriptions
+        that could not be restored.
+    :param node: Name of the node the recovered pub/sub connection belongs
+        to. ``None`` for standalone clients.
+    :param client_type: :class:`ClientType` of the pub/sub that recovered.
+    """
+
+    def __init__(
+        self,
+        disconnected_at: "datetime.datetime",
+        recovered_at: "datetime.datetime",
+        gap_seconds: float,
+        channels: Optional[List[object]] = None,
+        patterns: Optional[List[object]] = None,
+        shard_channels: Optional[List[object]] = None,
+        failures: Optional[List[PubSubRecoveryFailure]] = None,
+        node: Optional[str] = None,
+        client_type: Optional["ClientType"] = None,
+    ):
+        self._disconnected_at = disconnected_at
+        self._recovered_at = recovered_at
+        self._gap_seconds = gap_seconds
+        self._channels = list(channels) if channels else []
+        self._patterns = list(patterns) if patterns else []
+        self._shard_channels = list(shard_channels) if shard_channels else []
+        self._failures = list(failures) if failures else []
+        self._node = node
+        self._client_type = client_type
+
+    @property
+    def disconnected_at(self) -> "datetime.datetime":
+        return self._disconnected_at
+
+    @property
+    def recovered_at(self) -> "datetime.datetime":
+        return self._recovered_at
+
+    @property
+    def gap_seconds(self) -> float:
+        return self._gap_seconds
+
+    @property
+    def channels(self) -> List[object]:
+        return self._channels
+
+    @property
+    def patterns(self) -> List[object]:
+        return self._patterns
+
+    @property
+    def shard_channels(self) -> List[object]:
+        return self._shard_channels
+
+    @property
+    def failures(self) -> List[PubSubRecoveryFailure]:
+        return self._failures
+
+    @property
+    def node(self) -> Optional[str]:
+        return self._node
+
+    @property
+    def client_type(self) -> Optional["ClientType"]:
+        return self._client_type
+
+    def __repr__(self) -> str:
+        return (
+            "PubSubRecoveryEvent("
+            f"disconnected_at={self._disconnected_at!r}, "
+            f"recovered_at={self._recovered_at!r}, "
+            f"gap_seconds={self._gap_seconds!r}, "
+            f"channels={self._channels!r}, patterns={self._patterns!r}, "
+            f"shard_channels={self._shard_channels!r}, "
+            f"failures={self._failures!r}, node={self._node!r}, "
+            f"client_type={self._client_type!r})"
+        )
 
 
 class ClientType(Enum):

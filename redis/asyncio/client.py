@@ -6,6 +6,8 @@ import math
 import re
 import time
 import warnings
+from collections import deque
+from datetime import datetime, timezone
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -56,10 +58,13 @@ from redis.asyncio.observability.recorder import (
 from redis.asyncio.retry import Retry, _to_async_retry
 from redis.backoff import ExponentialWithJitterBackoff
 from redis.client import (
+    _NO_RECOVERY_RESPONSE,
+    _RECOVERY_ACK_MESSAGE_TYPES,
     EMPTY_RESPONSE,
     NEVER_DECODE,
     AbstractRedis,
     CaseInsensitiveDict,
+    _PubSubRecoveryState,
 )
 from redis.commands import (
     AsyncCoreCommands,
@@ -76,6 +81,7 @@ from redis.event import (
     AfterSingleConnectionInstantiationEvent,
     ClientType,
     EventDispatcher,
+    PubSubRecoveryEvent,
 )
 from redis.exceptions import (
     ConnectionError,
@@ -1190,6 +1196,7 @@ class PubSub:
         encoder=None,
         push_handler_func: Optional[Callable] = None,
         event_dispatcher: Optional["EventDispatcher"] = None,
+        recovery_handler: Optional[Callable] = None,
     ):
         if event_dispatcher is None:
             self._event_dispatcher = EventDispatcher()
@@ -1203,6 +1210,27 @@ class PubSub:
         # to lookup channel and pattern names for callback handlers.
         self.encoder = encoder
         self.push_handler_func = push_handler_func
+        # Optional sync callable or coroutine function invoked with a
+        # PubSubRecoveryEvent once after a subscribed connection is
+        # reconnected and all re-subscriptions have been confirmed or
+        # reported as failed. Notifications are scheduled on the event loop
+        # and never block the message loop. ``None`` keeps the feature
+        # disabled unless a dispatcher listener for PubSubRecoveryEvent
+        # exists.
+        self._recovery_handler = recovery_handler
+        # State of an in-progress disconnect -> recovery cycle, or None when
+        # no disconnect is being recovered. Every piece of recovery tracking
+        # is gated on this being non-None, so a pubsub without enabled
+        # notifications behaves exactly as it did before the feature existed.
+        self._recovery: Optional[_PubSubRecoveryState] = None
+        # Confirmation replies read inline during a tracked reconnect,
+        # replayed to listeners through parse_response. Lives outside the
+        # state object so confirmations of a finished recovery are still
+        # delivered after the state has been finalized.
+        self._recovery_queued_responses: "deque" = deque()
+        # Tasks scheduled to deliver recovery notifications, kept so they are
+        # not garbage-collected before they run.
+        self._recovery_tasks: Set[asyncio.Task] = set()
         if self.encoder is None:
             self.encoder = self.connection_pool.get_encoder()
         if self.encoder.decode_responses:
@@ -1257,6 +1285,12 @@ class PubSub:
             self.pending_unsubscribe_patterns = set()
             self.shard_channels = {}
             self.pending_unsubscribe_shard_channels = set()
+            self._recovery = None
+            # getattr: pubsubs built without __init__ (unit-test harnesses)
+            # may never have created the queue.
+            recovery_queue = getattr(self, "_recovery_queued_responses", None)
+            if recovery_queue is not None:
+                recovery_queue.clear()
 
     @deprecated_function(version="5.0.1", reason="Use aclose() instead", name="close")
     async def close(self) -> None:
@@ -1280,15 +1314,323 @@ class PubSub:
 
     async def on_connect(self, connection: Connection):
         """Re-subscribe to any channels and patterns previously subscribed to"""
+        # Fallback for reconnect paths that do not go through _reconnect or
+        # parse_response (e.g. a lazy connect inside send_command): this
+        # callback only runs on a re-established connection while
+        # subscriptions exist, so open the recovery window here too.
+        self._recovery_begin()
+        state = self._recovery
+        if state is not None:
+            # Snapshot before clearing: names already being unsubscribed are
+            # replayed (the replay must converge the fresh session) but must
+            # not show up as recovered in the event.
+            state.mark_unsubscribed(
+                (
+                    (state.kind_channel, name)
+                    for name in self.pending_unsubscribe_channels
+                )
+            )
+            state.mark_unsubscribed(
+                (
+                    (state.kind_pattern, name)
+                    for name in self.pending_unsubscribe_patterns
+                )
+            )
+            state.mark_unsubscribed(
+                (
+                    (state.kind_shard_channel, name)
+                    for name in self.pending_unsubscribe_shard_channels
+                )
+            )
         self.pending_unsubscribe_channels.clear()
         self.pending_unsubscribe_patterns.clear()
         self.pending_unsubscribe_shard_channels.clear()
-        if self.channels:
-            await self._resubscribe(self.channels, self.subscribe)
-        if self.patterns:
-            await self._resubscribe(self.patterns, self.psubscribe)
-        if self.shard_channels:
-            await self._resubscribe_shard_channels()
+        if state is None:
+            if self.channels:
+                await self._resubscribe(self.channels, self.subscribe)
+            if self.patterns:
+                await self._resubscribe(self.patterns, self.psubscribe)
+            if self.shard_channels:
+                await self._resubscribe_shard_channels()
+            return
+        # A recovery window is open: re-subscribe one subscription at a time
+        # and read each confirmation inline, so the recovery event can list
+        # exactly what was restored and attribute any rejection to the right
+        # channel. The confirmations are queued for parse_response, keeping
+        # the message stream identical to a non-instrumented reconnect.
+        await self._recovery_replay(connection)
+
+    # ------------------------------------------------------------------
+    # Pub/sub recovery notifications
+    # ------------------------------------------------------------------
+
+    def _recovery_notifications_enabled(self) -> bool:
+        if self._recovery_handler is not None:
+            return True
+        # ``is True`` keeps a truthy mock dispatcher from enabling the
+        # feature implicitly in unit tests.
+        return self._event_dispatcher.has_listeners(PubSubRecoveryEvent) is True
+
+    def _recovery_node_name(self) -> Optional[str]:
+        # Standalone pubsubs do not belong to a cluster node; ClusterPubSub
+        # overrides this to report the node it is connected to, and per-node
+        # shard pubsubs carry a ``_recovery_node`` instance tag.
+        return getattr(self, "_recovery_node", None)
+
+    def _recovery_begin(self) -> None:
+        """Open a recovery window when a disconnect is confirmed.
+
+        Idempotent within one outage: repeated retry attempts keep the
+        timestamp of the first confirmation until recovery completes.
+        """
+        if not self._recovery_notifications_enabled() or not self.subscribed:
+            return
+        if self._recovery is None:
+            # Anything still queued belongs to a previous session that is
+            # gone; the new session replays and queues fresh confirmations.
+            self._recovery_queued_responses.clear()
+            self._recovery = _PubSubRecoveryState()
+
+    def _recovery_normalize_name(self, name):
+        return next(iter(self._normalize_keys({name: None})))
+
+    def _recovery_pop_queued_response(self):
+        # Re-subscription confirmations read inline during the connect
+        # callback are handed back to the listener here, in order, so the
+        # observable message stream does not change when notifications are
+        # enabled.
+        if self._recovery_queued_responses:
+            return self._recovery_queued_responses.popleft()
+        return _NO_RECOVERY_RESPONSE
+
+    async def _recovery_replay(self, connection) -> None:
+        """Re-subscribe during a tracked reconnect, confirming each replay."""
+        state = self._recovery
+        if state is None:
+            return
+        state.replay_depth += 1
+        try:
+            if state.replay_depth == 1:
+                state.reset_results()
+                state.seed(self.channels, self.patterns, self.shard_channels)
+            if self.channels:
+                await self._recovery_replay_group(
+                    state.kind_channel, self.channels, self.subscribe, connection
+                )
+            if self.patterns:
+                await self._recovery_replay_group(
+                    state.kind_pattern,
+                    self.patterns,
+                    self.psubscribe,
+                    connection,
+                )
+            if self.shard_channels:
+                await self._recovery_replay_shard(connection)
+        finally:
+            state.replay_depth -= 1
+        if state.replay_depth == 0:
+            self._recovery_finalize_if_complete()
+
+    async def _recovery_replay_group(
+        self, kind, subscribed, subscribe_fn, connection
+    ) -> None:
+        """Replay one subscription kind, one name at a time, reading acks."""
+        state = self._recovery
+        for subscription in pubsub_subscription_args(subscribed):
+            raw_name = (
+                subscription.name
+                if isinstance(subscription, Subscription)
+                else subscription
+            )
+            name = self._recovery_normalize_name(raw_name)
+            try:
+                await subscribe_fn(subscription)
+                ack = await connection.read_response(
+                    disconnect_on_error=False, push_request=True
+                )
+            except (ConnectionError, TimeoutError, OSError):
+                # The fresh connection did not hold: the connect retry
+                # machinery replays the whole reconnect, so abort this pass
+                # instead of pinning a connectivity outage on one channel.
+                raise
+            except Exception as exc:
+                # The server rejected this subscription (or it could not be
+                # encoded/sent for a channel-local reason). Record it and keep
+                # going, so a sibling channel is not affected. The channel
+                # stays tracked locally and is retried on a later reconnect.
+                reason = str(exc) or type(exc).__name__
+                complete = state.fail(kind, name, reason)
+                if complete:
+                    self._recovery_finalize_if_complete()
+                continue
+            self._recovery_queued_responses.append(ack)
+            self._recovery_account_reply(ack, expected=(kind, name))
+
+    async def _recovery_replay_shard(self, connection) -> None:
+        # Standalone semantics: a single connection holds every shard
+        # channel, so each can be replayed and confirmed separately.
+        # ClusterPubSub overrides this to route via per-node pubsubs.
+        await self._recovery_replay_group(
+            _PubSubRecoveryState.kind_shard_channel,
+            self.shard_channels,
+            self.ssubscribe,
+            connection,
+        )
+
+    def _recovery_track_subscriptions(self, kind, subscriptions) -> List:
+        """Remember caller-issued subscribes while a recovery window is open."""
+        state = self._recovery
+        if state is None:
+            # A subscribe issued against a confirmed-dropped connection
+            # drives the reconnect itself (the lazy connect inside
+            # send_command runs on_connect mid-call): open the window up
+            # front so this subscription is part of the recovery instead of
+            # landing after it has already been reported.
+            if (
+                self.subscribed
+                and self.connection is not None
+                and not self.connection.is_connected
+            ):
+                self._recovery_begin()
+                state = self._recovery
+        if state is None:
+            return []
+        names = list(self._normalize_keys(subscriptions))
+        tracked = []
+        for name in names:
+            if state.track(kind, name):
+                tracked.append(name)
+        return tracked
+
+    def _recovery_untrack(self, kind, names) -> None:
+        # Drop names of a subscribe that failed before reaching the server,
+        # so they cannot wedge an otherwise complete recovery window.
+        state = self._recovery
+        if state is None:
+            return
+        pending = state.pending[kind]
+        for name in names:
+            if name not in state.recovered[kind]:
+                pending.discard(name)
+        self._recovery_finalize_if_complete()
+
+    def _recovery_account_reply(self, response, expected=None) -> None:
+        """Account a subscribe confirmation read off the wire."""
+        state = self._recovery
+        if state is None:
+            return
+        kind = None
+        name = None
+        if isinstance(response, (list, tuple)) and len(response) >= 2:
+            kind = _RECOVERY_ACK_MESSAGE_TYPES.get(str_if_bytes(response[0]))
+            if kind is not None:
+                name = self._recovery_normalize_name(response[1])
+        if kind is None:
+            # Not a subscribe confirmation (defensive - the connect callback
+            # only reads replies to the replay commands). Account the expected
+            # name so an unexpected frame cannot wedge the recovery forever.
+            if expected is not None:
+                kind, name = expected
+            else:
+                return
+        complete = state.resolve(kind, name)
+        if complete:
+            self._recovery_finalize_if_complete()
+
+    def _recovery_finalize_if_complete(self) -> None:
+        state = self._recovery
+        if state is None or state.replay_depth != 0:
+            return
+        if any(state.pending.values()):
+            return
+        self._recovery = None
+        event = PubSubRecoveryEvent(
+            disconnected_at=state.disconnected_at,
+            recovered_at=datetime.now(timezone.utc),
+            gap_seconds=max(0.0, time.monotonic() - state.disconnected_monotonic),
+            channels=[
+                name
+                for name in state.recovered[state.kind_channel]
+                if name in self.channels
+                and (state.kind_channel, name) not in state.unsubscribed
+            ],
+            patterns=[
+                name
+                for name in state.recovered[state.kind_pattern]
+                if name in self.patterns
+                and (state.kind_pattern, name) not in state.unsubscribed
+            ],
+            shard_channels=[
+                name
+                for name in state.recovered[state.kind_shard_channel]
+                if name in self.shard_channels
+                and (state.kind_shard_channel, name) not in state.unsubscribed
+            ],
+            failures=list(state.failures),
+            node=self._recovery_node_name(),
+            client_type=ClientType.ASYNC,
+        )
+        self._recovery_emit(event)
+
+    def _recovery_emit(self, event: PubSubRecoveryEvent) -> None:
+        # Delivery is scheduled rather than awaited, so a slow listener can
+        # never block the message loop. Scheduled callables and tasks are
+        # isolated: neither a failing handler nor a failing listener may
+        # surface as a pubsub error.
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # No running event loop (defensive): deliver sync callbacks
+            # inline; coroutine callbacks have nowhere to run.
+            if self._recovery_handler is not None and not inspect.iscoroutinefunction(
+                self._recovery_handler
+            ):
+                self._recovery_invoke_sync(self._recovery_handler, event)
+            self._recovery_invoke_sync(self._recovery_dispatch_sync, event)
+            return
+
+        if self._recovery_handler is not None:
+            if inspect.iscoroutinefunction(self._recovery_handler):
+                self._recovery_schedule(loop.create_task(self._recovery_handler(event)))
+            else:
+                loop.call_soon(
+                    self._recovery_invoke_sync, self._recovery_handler, event
+                )
+        if self._event_dispatcher.has_listeners(PubSubRecoveryEvent, is_async=False):
+            loop.call_soon(
+                self._recovery_invoke_sync, self._recovery_dispatch_sync, event
+            )
+        if self._event_dispatcher.has_listeners(PubSubRecoveryEvent, is_async=True):
+            self._recovery_schedule(
+                loop.create_task(self._event_dispatcher.dispatch_async(event))
+            )
+
+    def _recovery_dispatch_sync(self, event: PubSubRecoveryEvent) -> None:
+        self._event_dispatcher.dispatch(event)
+
+    def _recovery_invoke_sync(self, callback, event: PubSubRecoveryEvent) -> None:
+        try:
+            callback(event)
+        except Exception:
+            logger.exception("PubSub recovery notification raised")
+
+    def _recovery_schedule(self, task: "asyncio.Task") -> None:
+        self._recovery_tasks.add(task)
+
+        def _consume(done: "asyncio.Task") -> None:
+            self._recovery_tasks.discard(done)
+            exc = done.exception()
+            if exc is not None:
+                # Isolation: a failing async listener must not surface as a
+                # pubsub error; log it instead of letting it raise the
+                # "task exception was never retrieved" warning.
+                logger.error(
+                    "PubSub recovery notification raised: %r", exc, exc_info=exc
+                )
+
+        task.add_done_callback(_consume)
+
+    # ------------------------------------------------------------------
 
     @property
     def subscribed(self):
@@ -1317,6 +1659,8 @@ class PubSub:
             # were listening to when we were disconnected
             self.connection.register_connect_callback(self.on_connect)
         else:
+            if not self.connection.is_connected:
+                self._recovery_begin()
             await self.connection.connect()
         if self.push_handler_func is not None:
             self.connection._parser.set_pubsub_push_handler(self.push_handler_func)
@@ -1341,6 +1685,7 @@ class PubSub:
 
         In this error handler we are trying to reconnect to the server.
         """
+        self._recovery_begin()
         if (
             error
             and failure_count is not None
@@ -1461,31 +1806,45 @@ class PubSub:
 
         await self.check_health()
 
+        # Reconnect (opening a recovery window and running the connect
+        # callback, which fills the replay queue) before pulling queued
+        # confirmations, so the very first read after a drop returns them.
         if not conn.is_connected:
+            self._recovery_begin()
             await conn.connect()
 
-        # Block=True: signal "no timeout" to conn.read_response via
-        # math.inf. The connection treats math.inf as the per-read
-        # opt-in for blocking indefinitely without falling back to
-        # self.socket_timeout. Reconnect/AUTH/HELLO/resubscribe
-        # operations performed by the retry layer continue to honor
-        # self.socket_timeout because they do not pass math.inf.
-        #
-        # TODO(next-major): when the async Connection.read_response
-        # default for ``timeout`` is changed to SENTINEL, passing
-        # ``timeout=None`` from this method will become the natural
-        # "no timeout" signal and the math.inf hand-off can be
-        # removed. That swap is a breaking change to the
-        # Connection.read_response signature so it must wait for a
-        # major release.
-        read_timeout = math.inf if block else timeout
-        response = await self._execute(
-            conn,
-            conn.read_response,
-            timeout=read_timeout,
-            disconnect_on_error=False,
-            push_request=True,
-        )
+        if self._recovery is not None or self._recovery_queued_responses:
+            queued_response = self._recovery_pop_queued_response()
+        else:
+            queued_response = _NO_RECOVERY_RESPONSE
+
+        if queued_response is _NO_RECOVERY_RESPONSE:
+            # Block=True: signal "no timeout" to conn.read_response via
+            # math.inf. The connection treats math.inf as the per-read
+            # opt-in for blocking indefinitely without falling back to
+            # self.socket_timeout. Reconnect/AUTH/HELLO/resubscribe
+            # operations performed by the retry layer continue to honor
+            # self.socket_timeout because they do not pass math.inf.
+            #
+            # TODO(next-major): when the async Connection.read_response
+            # default for ``timeout`` is changed to SENTINEL, passing
+            # ``timeout=None`` from this method will become the natural
+            # "no timeout" signal and the math.inf hand-off can be
+            # removed. That swap is a breaking change to the
+            # Connection.read_response signature so it must wait for a
+            # major release.
+            read_timeout = math.inf if block else timeout
+            response = await self._execute(
+                conn,
+                conn.read_response,
+                timeout=read_timeout,
+                disconnect_on_error=False,
+                push_request=True,
+            )
+        else:
+            response = queued_response
+
+        self._recovery_account_reply(response)
 
         if conn.health_check_interval and response in self.health_check_response:
             # ignore the health check message as user might not expect it
@@ -1532,7 +1891,14 @@ class PubSub:
         message via ``listen()``.
         """
         new_patterns = parse_pubsub_subscriptions(args, kwargs)
-        ret_val = await self.execute_command("PSUBSCRIBE", *new_patterns.keys())
+        tracked = self._recovery_track_subscriptions(
+            _PubSubRecoveryState.kind_pattern, new_patterns
+        )
+        try:
+            ret_val = await self.execute_command("PSUBSCRIBE", *new_patterns.keys())
+        except Exception:
+            self._recovery_untrack(_PubSubRecoveryState.kind_pattern, tracked)
+            raise
         # update the patterns dict AFTER we send the command. we don't want to
         # subscribe twice to these patterns, once for the command and again
         # for the reconnection.
@@ -1570,7 +1936,14 @@ class PubSub:
         message via ``listen()`` or ``get_message()``.
         """
         new_channels = parse_pubsub_subscriptions(args, kwargs)
-        ret_val = await self.execute_command("SUBSCRIBE", *new_channels.keys())
+        tracked = self._recovery_track_subscriptions(
+            _PubSubRecoveryState.kind_channel, new_channels
+        )
+        try:
+            ret_val = await self.execute_command("SUBSCRIBE", *new_channels.keys())
+        except Exception:
+            self._recovery_untrack(_PubSubRecoveryState.kind_channel, tracked)
+            raise
         # update the channels dict AFTER we send the command. we don't want to
         # subscribe twice to these channels, once for the command and again
         # for the reconnection.
@@ -1610,7 +1983,14 @@ class PubSub:
         via ``listen()`` or ``get_sharded_message()``.
         """
         new_s_channels = parse_pubsub_subscriptions(args, kwargs)
-        ret_val = await self.execute_command("SSUBSCRIBE", *new_s_channels.keys())
+        tracked = self._recovery_track_subscriptions(
+            _PubSubRecoveryState.kind_shard_channel, new_s_channels
+        )
+        try:
+            ret_val = await self.execute_command("SSUBSCRIBE", *new_s_channels.keys())
+        except Exception:
+            self._recovery_untrack(_PubSubRecoveryState.kind_shard_channel, tracked)
+            raise
         # update the s_channels dict AFTER we send the command. we don't want to
         # subscribe twice to these channels, once for the command and again
         # for the reconnection.
