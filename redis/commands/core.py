@@ -11008,7 +11008,6 @@ class Script:
         args = args or []
         if client is None:
             client = self.registered_client
-        args = tuple(keys) + tuple(args)
         # make sure the Redis server knows about the script
         from redis.client import Pipeline
         from redis.cluster import ClusterPipeline
@@ -11017,9 +11016,11 @@ class Script:
             # Make sure the pipeline can register the script before executing.
             client.scripts.add(self)
         if isinstance(client, ClusterPipeline):
-            # ClusterPipeline does not support script_load. Queue EVALSHA and
-            # leave NOSCRIPT recovery to the caller (same as AsyncScript).
-            return client.evalsha(self.sha, len(keys), *args)
+            # Queue EVALSHA and hand the pipeline the Script object so it can
+            # preload the script on the target node and recover from NOSCRIPT
+            # itself (keys and args are kept separate for slot routing).
+            return client.register_script_command(self, tuple(keys), tuple(args))
+        args = tuple(keys) + tuple(args)
         try:
             return client.evalsha(self.sha, len(keys), *args)
         except NoScriptError:
@@ -11088,7 +11089,6 @@ class AsyncScript:
         args = args or []
         if client is None:
             client = self.registered_client
-        args = tuple(keys) + tuple(args)
         # make sure the Redis server knows about the script
         from redis.asyncio.client import Pipeline
         from redis.asyncio.cluster import ClusterPipeline
@@ -11097,9 +11097,12 @@ class AsyncScript:
             # Make sure the pipeline can register the script before executing.
             client.scripts.add(self)
         if isinstance(client, ClusterPipeline):
-            # ClusterPipeline.evalsha queues synchronously. Awaiting the
-            # pipeline would call initialize() and drop the queued command.
-            return client.evalsha(self.sha, len(keys), *args)
+            # register_script_command queues synchronously (it must not await
+            # the pipeline, which would call initialize() and drop the queued
+            # command) and hands the pipeline the Script object so it can
+            # preload it on the target node and recover from NOSCRIPT itself.
+            return client.register_script_command(self, tuple(keys), tuple(args))
+        args = tuple(keys) + tuple(args)
         try:
             return await client.evalsha(self.sha, len(keys), *args)
         except NoScriptError:

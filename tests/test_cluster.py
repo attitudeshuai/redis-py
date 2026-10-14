@@ -59,6 +59,7 @@ from redis.exceptions import (
     DataError,
     MovedError,
     NoPermissionError,
+    NoScriptError,
     RedisClusterException,
     RedisClusterUnreachableError,
     RedisError,
@@ -4827,6 +4828,321 @@ def test_script_queues_evalsha_on_cluster_pipeline():
             assert len(queue) == 1
             assert queue[0].args[0] == "EVALSHA"
             assert queue[0].args[1] == script.sha
+            assert queue[0].script is script
+    finally:
+        r.close()
+
+
+def _scripted_node_connection(node, responses):
+    """
+    Attach a mock connection to ``node`` whose read_response() serves the
+    scripted ``responses`` in order (Exception instances are raised). Every
+    SCRIPT/individual-command call and the packed pipeline batch are recorded
+    in the returned ``wire`` log. The mock drives the real retry wrapper so
+    NOSCRIPT replays routed through the cluster client hit the same script.
+    """
+    responses = iter(responses)
+    wire = []
+    connection = Mock()
+
+    def read_response(*args, **kwargs):
+        value = next(responses)
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    def send_command(*args, **kwargs):
+        wire.append(tuple(args))
+
+    connection.read_response.side_effect = read_response
+    connection.send_command.side_effect = send_command
+    connection.send_packed_command.side_effect = lambda *a, **k: wire.append(
+        ("PACKED",)
+    )
+    connection.pack_commands.side_effect = lambda cmds: list(cmds)
+    connection.retry.call_with_retry.side_effect = lambda fn, *a, **k: fn()
+    node.redis_connection.connection = connection
+    return connection, wire
+
+
+def _tags_on_different_nodes(r, count=2):
+    """Find hash tags whose keys are owned by different primary nodes."""
+    tags = {}
+    for i in range(10000):
+        tag = f"{{{i}}}"
+        node = r.nodes_manager.get_node_from_slot(key_slot(tag.encode()), False)
+        tags.setdefault(node.name, tag)
+        if len(tags) == count:
+            return list(tags.values())
+    raise AssertionError("could not find tags on different nodes")
+
+
+@pytest.mark.onlycluster
+def test_script_pipeline_preloads_missing_script_before_execute():
+    """First execution auto-loads the registered script on its target node."""
+    r = get_mocked_redis_client(host=default_host, port=default_port)
+    try:
+        script = r.register_script("return 42")
+        node = r.nodes_manager.get_node_from_slot(key_slot(b"{user}a"), False)
+        _connection, wire = _scripted_node_connection(
+            node, [[False], script.sha, 42]
+        )
+        with r.pipeline() as pipe:
+            script(keys=["{user}a"], args=[3], client=pipe)
+            assert pipe.execute() == [42]
+
+        # SCRIPT EXISTS/SCRIPT LOAD precede the packed batch.
+        assert wire[0][0] == "SCRIPT EXISTS"
+        assert wire[0][1] == script.sha
+        assert wire[1][0] == "SCRIPT LOAD"
+        assert wire[1][1] == "return 42"
+        assert wire[2] == ("PACKED",)
+    finally:
+        r.close()
+
+
+@pytest.mark.onlycluster
+def test_script_pipeline_preload_skips_cached_script():
+    """A script the node already holds is not loaded again."""
+    r = get_mocked_redis_client(host=default_host, port=default_port)
+    try:
+        script = r.register_script("return 42")
+        node = r.nodes_manager.get_node_from_slot(key_slot(b"{user}a"), False)
+        _connection, wire = _scripted_node_connection(node, [[True], 42])
+        with r.pipeline() as pipe:
+            script(keys=["{user}a"], client=pipe)
+            assert pipe.execute() == [42]
+
+        assert [entry[0] for entry in wire if entry != ("PACKED",)] == [
+            "SCRIPT EXISTS"
+        ]
+    finally:
+        r.close()
+
+
+@pytest.mark.onlycluster
+def test_script_pipeline_recovers_from_noscript():
+    """A flushed script cache self-heals on the next pipeline execution."""
+    r = get_mocked_redis_client(host=default_host, port=default_port)
+    try:
+        script = r.register_script("return 42")
+        node = r.nodes_manager.get_node_from_slot(key_slot(b"{user}a"), False)
+        _connection, wire = _scripted_node_connection(
+            node,
+            [
+                [False],
+                script.sha,  # preload SCRIPT LOAD
+                NoScriptError("NOSCRIPT first attempt"),  # packed EVALSHA
+                script.sha,  # recovery SCRIPT LOAD
+                7,  # replayed EVALSHA through the cluster client
+            ],
+        )
+        with r.pipeline() as pipe:
+            script(keys=["{user}a"], args=[3], client=pipe)
+            assert pipe.execute() == [7]
+
+        assert wire[0][0] == "SCRIPT EXISTS"
+        assert wire[2] == ("PACKED",)
+        assert wire[3][0] == "SCRIPT LOAD"
+        assert wire[4][0] == "EVALSHA"
+    finally:
+        r.close()
+
+
+@pytest.mark.onlycluster
+def test_script_pipeline_noscript_replay_is_bounded():
+    """Persistent NOSCRIPT after reload surfaces the original NOSCRIPT error."""
+    r = get_mocked_redis_client(host=default_host, port=default_port)
+    try:
+        script = r.register_script("return 42")
+        node = r.nodes_manager.get_node_from_slot(key_slot(b"{user}a"), False)
+        _scripted_node_connection(
+            node,
+            [
+                [False],
+                script.sha,
+                NoScriptError("NOSCRIPT original"),
+                script.sha,
+                NoScriptError("NOSCRIPT after replay"),
+            ],
+        )
+        with r.pipeline() as pipe:
+            script(keys=["{user}a"], client=pipe)
+            with pytest.raises(NoScriptError, match="NOSCRIPT original"):
+                pipe.execute()
+    finally:
+        r.close()
+
+
+@pytest.mark.onlycluster
+def test_plain_evalsha_is_not_preloaded_or_recovered():
+    """Hand-written evalsha keeps its raw behavior, including raw NOSCRIPT."""
+    r = get_mocked_redis_client(host=default_host, port=default_port)
+    try:
+        sha = "a" * 40
+        node = r.nodes_manager.get_node_from_slot(key_slot(b"{user}a"), False)
+        _connection, wire = _scripted_node_connection(
+            node, [NoScriptError("NOSCRIPT plain evalsha")]
+        )
+        with r.pipeline() as pipe:
+            pipe.evalsha(sha, 1, "{user}a")
+            assert pipe._execution_strategy.command_queue[0].script is None
+            with pytest.raises(NoScriptError, match="NOSCRIPT plain evalsha"):
+                pipe.execute()
+
+        # The batch is the only thing sent; no SCRIPT commands.
+        assert wire == [("PACKED",)]
+    finally:
+        r.close()
+
+
+@pytest.mark.onlycluster
+def test_script_pipeline_load_failure_names_node_and_sha():
+    """A preload failure identifies node and script digest and sends no batch."""
+    r = get_mocked_redis_client(host=default_host, port=default_port)
+    try:
+        script = r.register_script("return 42")
+        node = r.nodes_manager.get_node_from_slot(key_slot(b"{user}a"), False)
+        _connection, wire = _scripted_node_connection(
+            node, [[False], ResponseError("ERR boom")]
+        )
+        with r.pipeline() as pipe:
+            script(keys=["{user}a"], client=pipe)
+            with pytest.raises(
+                RedisClusterException,
+                match=rf"script {script.sha} into node {node.name}",
+            ):
+                pipe.execute()
+        assert ("PACKED",) not in wire
+    finally:
+        r.close()
+
+
+@pytest.mark.onlycluster
+def test_script_pipeline_preloads_only_on_target_nodes():
+    """Scripts are loaded only on the nodes their keys actually target."""
+    r = get_mocked_redis_client(host=default_host, port=default_port)
+    try:
+        tag_a, tag_b = _tags_on_different_nodes(r)
+        script_a = r.register_script("return 1")
+        script_b = r.register_script("return 2")
+        node_a = r.nodes_manager.get_node_from_slot(key_slot(tag_a.encode()), False)
+        node_b = r.nodes_manager.get_node_from_slot(key_slot(tag_b.encode()), False)
+        _conn_a, wire_a = _scripted_node_connection(
+            node_a, [[False], script_a.sha, 1]
+        )
+        _conn_b, wire_b = _scripted_node_connection(
+            node_b, [[False], script_b.sha, 2]
+        )
+        with r.pipeline() as pipe:
+            script_a(keys=[tag_a], client=pipe)
+            script_b(keys=[tag_b], client=pipe)
+            assert pipe.execute() == [1, 2]
+
+        loads_a = [entry for entry in wire_a if entry[0] == "SCRIPT LOAD"]
+        loads_b = [entry for entry in wire_b if entry[0] == "SCRIPT LOAD"]
+        assert [entry[1] for entry in loads_a] == ["return 1"]
+        assert [entry[1] for entry in loads_b] == ["return 2"]
+    finally:
+        r.close()
+
+
+@pytest.mark.onlycluster
+def test_script_pipeline_recovery_keeps_result_positions():
+    """Recovered commands keep their queue position alongside other commands."""
+    r = get_mocked_redis_client(host=default_host, port=default_port)
+    try:
+        script_one = r.register_script("return 11")
+        script_two = r.register_script("return 22")
+        node = r.nodes_manager.get_node_from_slot(key_slot(b"{user}a"), False)
+        _scripted_node_connection(
+            node,
+            [
+                [False, False],
+                script_one.sha,
+                script_two.sha,
+                NoScriptError("NOSCRIPT one"),  # batched EVALSHA #1
+                "plain-value",  # batched GET
+                NoScriptError("NOSCRIPT two"),  # batched EVALSHA #2
+                script_one.sha,  # recovery LOAD + replay script one
+                11,
+                script_two.sha,  # recovery LOAD + replay script two
+                22,
+            ],
+        )
+        with r.pipeline() as pipe:
+            script_one(keys=["{user}a"], client=pipe)
+            pipe.get("{user}x")
+            script_two(keys=["{user}a"], client=pipe)
+            assert pipe.execute() == [11, "plain-value", 22]
+    finally:
+        r.close()
+
+
+@pytest.mark.onlycluster
+def test_script_pipeline_reload_updates_script_sha():
+    """A sha returned by SCRIPT LOAD updates the Script and queued commands."""
+    r = get_mocked_redis_client(host=default_host, port=default_port)
+    try:
+        script = r.register_script("return 42")
+        real_sha = script.sha
+        # Simulate a discrepancy between the stored digest and the server.
+        script.sha = "b" * 40
+        node = r.nodes_manager.get_node_from_slot(key_slot(b"{user}a"), False)
+        connection, wire = _scripted_node_connection(node, [[False], real_sha, 42])
+        with r.pipeline() as pipe:
+            script(keys=["{user}a"], client=pipe)
+            assert pipe.execute() == [42]
+
+        assert script.sha == real_sha
+        packed = connection.pack_commands.call_args.args[0]
+        evalsha_args = next(args for args in packed if args[0] == "EVALSHA")
+        assert evalsha_args[1] == real_sha
+    finally:
+        r.close()
+
+
+@pytest.mark.onlycluster
+def test_script_transaction_pipeline_preloads_before_multi():
+    """Transactional pipelines load all scripts on the transaction node first."""
+    r = get_mocked_redis_client(host=default_host, port=default_port)
+    try:
+        script = r.register_script("return 42")
+        node = r.nodes_manager.get_node_from_slot(key_slot(b"{user}a"), False)
+        _connection, wire = _scripted_node_connection(
+            node, [[False], script.sha, b"OK", b"QUEUED", [42]]
+        )
+        with r.pipeline(transaction=True) as pipe:
+            script(keys=["{user}a"], client=pipe)
+            assert pipe.execute() == [42]
+
+        assert wire[0][0] == "SCRIPT EXISTS"
+        assert wire[1][0] == "SCRIPT LOAD"
+        # The MULTI/EXEC block is the one packed write, sent only after loading.
+        assert wire.count(("PACKED",)) == 1
+        assert wire.index(("PACKED",)) == 2
+    finally:
+        r.close()
+
+
+@pytest.mark.onlycluster
+def test_script_transaction_pipeline_load_failure_sends_no_multi():
+    """A transactional preload failure raises before MULTI is ever written."""
+    r = get_mocked_redis_client(host=default_host, port=default_port)
+    try:
+        script = r.register_script("return 42")
+        node = r.nodes_manager.get_node_from_slot(key_slot(b"{user}a"), False)
+        _connection, wire = _scripted_node_connection(
+            node, [[False], ResponseError("ERR bad script")]
+        )
+        with r.pipeline(transaction=True) as pipe:
+            script(keys=["{user}a"], client=pipe)
+            with pytest.raises(
+                RedisClusterException,
+                match=rf"script {script.sha} into node {node.name}",
+            ):
+                pipe.execute()
+        assert ("PACKED",) not in wire
     finally:
         r.close()
 
@@ -5019,6 +5335,76 @@ class TestClusterPipeline:
             pipe.evalsha(sha, 0)
             pipe.evalsha(sha, 0)
             assert pipe.execute() == [42, 42]
+
+    def test_registered_script_pipeline_self_heals_after_flush(self, r):
+        """
+        A registered Script needs no manual script_load: the first pipeline
+        execution preloads it, and after a node script-cache flush the next
+        pipeline execution reloads and replays automatically.
+        """
+        multiply = "return redis.call('GET', KEYS[1]) * ARGV[1]"
+        script = r.register_script(multiply)
+        r.set("{user}a", 2)
+        with r.pipeline() as pipe:
+            script(keys=["{user}a"], args=[3], client=pipe)
+            assert pipe.execute() == [6]
+
+        # Simulate a restart / cache loss on the node owning the script's key.
+        node = r.nodes_manager.get_node_from_slot(key_slot(b"{user}a"), False)
+        node.redis_connection.script_flush()
+
+        with r.pipeline() as pipe:
+            script(keys=["{user}a"], args=[4], client=pipe)
+            assert pipe.execute() == [8]
+
+    def test_registered_script_pipeline_recovery_keeps_positions(self, r):
+        """Multiple flushed script commands recover at their queue positions."""
+        script = r.register_script(
+            "return redis.call('GET', KEYS[1]) * ARGV[1]"
+        )
+        r.set("{user}a", 2)
+        r.set("{user}b", 3)
+        node = r.nodes_manager.get_node_from_slot(key_slot(b"{user}a"), False)
+        node.redis_connection.script_flush()
+        with r.pipeline() as pipe:
+            script(keys=["{user}a"], args=[3], client=pipe)
+            pipe.get("{user}c")
+            script(keys=["{user}b"], args=[4], client=pipe)
+            assert pipe.execute() == [6, b"2", 12]
+
+    def test_registered_script_pipeline_preloads_on_each_target_node(self, r):
+        """Scripts are auto-loaded only on the nodes their keys target."""
+        tag_a, tag_b = _tags_on_different_nodes(r)
+        script_a = r.register_script("return 1")
+        script_b = r.register_script("return 2")
+        node_a = r.nodes_manager.get_node_from_slot(key_slot(tag_a.encode()), False)
+        node_b = r.nodes_manager.get_node_from_slot(key_slot(tag_b.encode()), False)
+        node_a.redis_connection.script_flush()
+        node_b.redis_connection.script_flush()
+        with r.pipeline() as pipe:
+            script_a(keys=[tag_a], client=pipe)
+            script_b(keys=[tag_b], client=pipe)
+            assert pipe.execute() == [1, 2]
+
+    def test_registered_script_transaction_pipeline_auto_loads(self, r):
+        """A transactional pipeline loads the scripts before MULTI itself."""
+        node = r.nodes_manager.get_node_from_slot(key_slot(b"{user}a"), False)
+        node.redis_connection.script_flush()
+        script = r.register_script("return 42")
+        with r.pipeline(transaction=True) as pipe:
+            script(keys=["{user}a"], client=pipe)
+            script(keys=["{user}b"], client=pipe)
+            assert pipe.execute() == [42, 42]
+
+    def test_plain_evalsha_in_pipeline_still_raw_noscript(self, r):
+        """Hand-written evalsha in a pipeline gets no implicit recovery."""
+        sha = r.script_load("return 42")
+        node = r.nodes_manager.get_node_from_slot(key_slot(b"{user}a"), False)
+        node.redis_connection.script_flush()
+        with r.pipeline() as pipe:
+            pipe.evalsha(sha, 1, "{user}a")
+            with pytest.raises(NoScriptError):
+                pipe.execute()
 
     def test_redis_cluster_pipeline(self, r):
         """

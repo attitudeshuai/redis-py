@@ -80,6 +80,7 @@ from redis.exceptions import (
     InvalidPipelineStack,
     MaxConnectionsError,
     MovedError,
+    NoScriptError,
     RedisClusterException,
     RedisClusterUnreachableError,
     RedisError,
@@ -4698,6 +4699,16 @@ class ClusterPipeline(RedisCluster):
     def script_load_for_pipeline(self, *args, **kwargs):
         self._execution_strategy.script_load_for_pipeline(*args, **kwargs)
 
+    def register_script_command(self, script, keys, script_args):
+        """
+        Queue EVALSHA for a registered Script and remember the association so
+        the execution strategy can preload the script on the command's target
+        node before executing and recover from NOSCRIPT.
+        """
+        return self._execution_strategy.register_script_command(
+            script, keys, script_args
+        )
+
     def delete(self, *names):
         self._execution_strategy.delete(*names)
 
@@ -4832,6 +4843,13 @@ class PipelineCommand:
         self.result = None
         self.node = None
         self.asking = False
+        # When the command was queued through a registered Script, the Script
+        # object so the execution strategy can preload it on its target node
+        # and reload/replay it on NOSCRIPT. None for plain evalsha usage.
+        self.script = None
+        # Number of reload-and-replay attempts already spent on this command
+        # after NOSCRIPT responses. Bounds the self-healing loop.
+        self.noscript_attempts = 0
         # Either record type: a policy resolver serves ``CommandPolicies``, while the
         # fallbacks below reuse the shared ``CommandMetadata`` defaults. Only the two routing
         # policies, which both carry, are ever read.
@@ -5010,6 +5028,14 @@ class ExecutionStrategy(ABC):
         pass
 
     @abstractmethod
+    def register_script_command(self, script, keys, script_args):
+        """
+        Queue EVALSHA for a registered Script and associate the command with
+        the Script object so the strategy can preload/recover it.
+        """
+        pass
+
+    @abstractmethod
     def delete(self, *names):
         """
         "Delete a key specified by ``names``"
@@ -5094,6 +5120,80 @@ class AbstractStrategy(ExecutionStrategy):
             "method script_load_for_pipeline() is not implemented"
         )
 
+    def register_script_command(self, script, keys, script_args):
+        """
+        Queue EVALSHA for a registered Script and tag the queued command with
+        the Script object so it can be preloaded and recovered from NOSCRIPT.
+
+        TransactionStrategy overrides this so the command's slot is resolved
+        the same way as every other queued transaction command.
+        """
+        keys = tuple(keys)
+        args = ("EVALSHA", script.sha, len(keys), *keys, *tuple(script_args))
+        command = PipelineCommand(args, {}, len(self._command_queue))
+        command.script = script
+        self._command_queue.append(command)
+        return self._pipe
+
+    def _scripts_in_commands(self, commands) -> "dict[str, Any]":
+        """Map sha -> Script for every distinct registered script in commands."""
+        scripts = {}
+        for c in commands:
+            if c.script is not None:
+                scripts.setdefault(c.script.sha, c.script)
+        return scripts
+
+    def _load_script_on_connection(self, connection, redis_node, node, script):
+        """
+        SCRIPT LOAD ``script`` on ``connection`` (bound to ``node``).
+
+        Updates ``script.sha`` with the server-returned digest, which affects
+        every later call of that Script object on any client. Connection and
+        timeout errors propagate so the regular cluster retry handling applies;
+        anything else is wrapped in an error identifying the node and script.
+        """
+        try:
+            connection.send_command("SCRIPT LOAD", script.script)
+            actual_sha = redis_node.parse_response(connection, "SCRIPT LOAD")
+        except (ConnectionError, TimeoutError):
+            raise
+        except Exception as e:
+            raise RedisClusterException(
+                f"Unable to load script {script.sha} into node {node.name}: {e}"
+            ) from e
+        if actual_sha != script.sha:
+            script.sha = actual_sha
+
+    def _script_exists_on_connection(self, connection, redis_node, shas):
+        """SCRIPT EXISTS for ``shas`` on ``connection``, returns list[bool]."""
+        connection.send_command("SCRIPT EXISTS", *shas)
+        return redis_node.parse_response(connection, "SCRIPT EXISTS")
+
+    def _preload_scripts_on_connection(self, connection, redis_node, node, commands):
+        """
+        Ensure every registered script referenced by ``commands`` is present in
+        ``node``'s script cache. Only scripts the node reports missing are
+        loaded. Must run before the commands are sent.
+        """
+        scripts = self._scripts_in_commands(commands)
+        if not scripts:
+            return
+        shas = list(scripts.keys())
+        exists = self._script_exists_on_connection(connection, redis_node, shas)
+        for sha, present in zip(shas, exists):
+            if not present:
+                script = scripts[sha]
+                self._load_script_on_connection(
+                    connection, redis_node, node, script
+                )
+                self._refresh_script_sha_in_queue(script)
+
+    def _refresh_script_sha_in_queue(self, script):
+        """Point queued EVALSHA commands at the (possibly updated) script.sha."""
+        for c in self._command_queue:
+            if c.script is script and c.args[1] != script.sha:
+                c.args = (c.args[0], script.sha, *c.args[2:])
+
     def annotate_exception(self, exception, number, command):
         """
         Provides extra context to the exception prior to it being handled
@@ -5107,6 +5207,10 @@ class AbstractStrategy(ExecutionStrategy):
 
 
 class PipelineStrategy(AbstractStrategy):
+    # Max times a single queued script command is reloaded and replayed after
+    # a NOSCRIPT response before the original NOSCRIPT error is raised.
+    NOSCRIPT_RETRY_LIMIT = 1
+
     def __init__(self, pipe: ClusterPipeline):
         super().__init__(pipe)
         self.command_flags = pipe.command_flags
@@ -5323,6 +5427,14 @@ class PipelineStrategy(AbstractStrategy):
             # lazy prepare, so pre-flight the PREPARE (once per node) here.
             for node_name, n in nodes.items():
                 redis_node = self._pipe.get_redis_connection(node_objs[node_name])
+                # Preload registered scripts used by this node's commands on this
+                # node only, before any queued command is written.
+                self._preload_scripts_on_connection(
+                    n.connection,
+                    redis_node,
+                    node_objs[node_name],
+                    n.commands,
+                )
                 self._himport_prepare_pipeline(
                     redis_node, n.connection, [(c.args, c.options) for c in n.commands]
                 )
@@ -5335,8 +5447,13 @@ class PipelineStrategy(AbstractStrategy):
                 nodes_written += 1
                 n.write()
 
-            for n in node_commands:
+            for node_name, n in nodes.items():
                 n.read()
+
+                # Registered scripts that came back NOSCRIPT are reloaded on
+                # this node and replayed here, while its connection is still
+                # checked out. Result positions never change.
+                self._recover_noscript_commands(node_objs[node_name], n)
 
                 # Find the first error in this node's commands, if any
                 node_error = None
@@ -5439,6 +5556,44 @@ class PipelineStrategy(AbstractStrategy):
             self._raise_first_error(stack, start_time)
 
         return response
+
+    def _recover_noscript_commands(self, node, node_commands: NodeCommands):
+        """
+        Reload and replay this node's script commands that returned NOSCRIPT.
+
+        Plain evalsha commands are left untouched, and once the per-command
+        replay budget is spent the original NOSCRIPT error is kept. The replay
+        goes through the cluster client, so a slot migration in between follows
+        the existing MOVED/ASK redirect handling.
+        """
+        pending = [
+            c
+            for c in node_commands.commands
+            if isinstance(c.result, NoScriptError) and c.script is not None
+        ]
+        if not pending:
+            return
+        redis_node = self._pipe.get_redis_connection(node)
+        for c in pending:
+            if c.noscript_attempts >= self.NOSCRIPT_RETRY_LIMIT:
+                continue
+            original_error = c.result
+            c.noscript_attempts += 1
+            try:
+                self._load_script_on_connection(
+                    node_commands.connection, redis_node, node, c.script
+                )
+                self._refresh_script_sha_in_queue(c.script)
+                c.result = self._pipe.parent_execute_command(*c.args)
+            except (ConnectionError, TimeoutError):
+                # Hand the connection failure to the outer cluster retry loop.
+                raise
+            except NoScriptError:
+                # The script is still missing after reload; the spent budget
+                # makes the next pass keep this original NOSCRIPT error.
+                c.result = original_error
+            except RedisError as e:
+                c.result = e
 
     def _is_nodes_flag(self, target_nodes):
         return isinstance(target_nodes, str) and target_nodes in self._pipe.node_flags
@@ -5834,6 +5989,18 @@ class TransactionStrategy(AbstractStrategy):
 
         redis_node, connection = self._get_client_and_connection_for_transaction()
 
+        # All transaction commands - and therefore their scripts - target the
+        # node of the single transaction slot. Load every registered script
+        # there BEFORE MULTI is sent: a NOSCRIPT inside MULTI/EXEC cannot be
+        # replayed locally without aborting the transaction. A load failure
+        # raises here, so no (half) transaction is ever issued.
+        transaction_node = self._nodes_manager.get_node_from_slot(
+            next(iter(self._pipeline_slots)), False
+        )
+        self._preload_scripts_on_connection(
+            connection, redis_node, transaction_node, self._command_queue
+        )
+
         # Ensure fieldsets referenced by buffered HIMPORT SETs are prepared on this
         # node's connection before the MULTI/EXEC block (session state, not
         # transactional). All keys share one slot here, so it is a single node.
@@ -5990,6 +6157,19 @@ class TransactionStrategy(AbstractStrategy):
         raise NotImplementedError(
             "send_cluster_commands cannot be executed in transactional context."
         )
+
+    def register_script_command(self, script, keys, script_args):
+        # Route through execute_command() so the EVALSHA's slot is resolved and
+        # tracked exactly like every other transaction command (including the
+        # WATCH-phase immediate path), then tag the queued command with the
+        # Script object for pre-execution loading.
+        keys = tuple(keys)
+        args = ("EVALSHA", script.sha, len(keys), *keys, *tuple(script_args))
+        queue_len = len(self._command_queue)
+        result = self.execute_command(*args)
+        if len(self._command_queue) > queue_len:
+            self._command_queue[-1].script = script
+        return result
 
     def multi(self):
         if self._explicit_transaction:

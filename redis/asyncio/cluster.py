@@ -37,6 +37,7 @@ if TYPE_CHECKING:
     from redis.asyncio.keyspace_notifications import (
         AsyncClusterKeyspaceNotifications,
     )
+    from redis.commands.core import Script
 
 from redis._defaults import (
     DEFAULT_RETRY_BASE,
@@ -121,6 +122,7 @@ from redis.exceptions import (
     InvalidPipelineStack,
     MaxConnectionsError,
     MovedError,
+    NoScriptError,
     RedisClusterException,
     RedisClusterUnreachableError,
     RedisError,
@@ -765,6 +767,12 @@ class RedisCluster(
 
         self._initialize = True
         self._lock: Optional[asyncio.Lock] = None
+
+        # In-flight cluster-pipeline SCRIPT LOAD calls keyed by (node name, sha).
+        # Pipelines executing concurrently share this registry, so the same script
+        # is never loaded twice onto the same node at the same time. Tasks remove
+        # themselves on completion, so a failed load can be retried later.
+        self._script_load_tasks: Dict[Tuple[str, str], "asyncio.Future[Any]"] = {}
 
         # When used as an async context manager, we need to increment and decrement
         # a usage counter so that we can close the connection pool when no one is
@@ -1672,6 +1680,50 @@ class RedisCluster(
             error=e,
         )
         raise e
+
+    async def ensure_script_loaded(self, node: "ClusterNode", script: "Script") -> None:
+        """
+        Ensure ``script`` is present in ``node``'s server-side script cache.
+
+        Concurrent callers for the same ``(node, sha)`` - including pipelines
+        executing concurrently - share a single SCRIPT LOAD, so a script is
+        never loaded twice onto the same node at the same time. On success the
+        Script object's ``sha`` is updated with the server-returned digest,
+        affecting every later call of that script on any client.
+        """
+        key = (node.name, script.sha)
+        task = self._script_load_tasks.get(key)
+        if task is None:
+            # No await between the lookup and the insert, so this is atomic on a
+            # single event loop.
+            task = asyncio.ensure_future(self._load_script_on_node(node, script))
+            self._script_load_tasks[key] = task
+            task.add_done_callback(
+                lambda _, task_key=key: self._script_load_tasks.pop(task_key, None)
+            )
+        actual_sha = await task
+        if actual_sha != script.sha:
+            script.sha = actual_sha
+
+    async def _load_script_on_node(self, node: "ClusterNode", script: "Script") -> str:
+        """Issue a single SCRIPT LOAD for ``script`` on ``node``."""
+        connection = node.acquire_connection()
+        try:
+            await node.disconnect_if_needed(connection)
+            await connection.send_command("SCRIPT LOAD", script.script)
+            try:
+                return await node.parse_response(connection, "SCRIPT LOAD")
+            except (ConnectionError, TimeoutError, OSError, ClusterDownError):
+                raise
+            except Exception as e:
+                raise RedisClusterException(
+                    f"Unable to load script {script.sha} into node {node.name}: {e}"
+                ) from e
+        finally:
+            try:
+                await node.disconnect_if_needed(connection)
+            finally:
+                node.release(connection)
 
     def pipeline(
         self, transaction: Optional[Any] = None, shard_hint: Optional[Any] = None
@@ -2891,6 +2943,21 @@ class ClusterPipeline(AbstractRedis, AbstractRedisCluster, AsyncRedisClusterComm
 
         return self
 
+    def register_script_command(
+        self, script: "Script", keys: tuple, script_args: tuple
+    ) -> "ClusterPipeline":
+        """
+        Queue EVALSHA for a registered Script and remember the association so
+        the execution strategy can preload the script on the command's target
+        node before executing and recover from NOSCRIPT.
+
+        Synchronous on purpose: it only queues, and awaiting here would run
+        ``initialize()`` / drop the queued command.
+        """
+        return self._execution_strategy.register_script_command(
+            script, keys, script_args
+        )
+
     async def reset(self):
         """
         Reset back to empty pipeline.
@@ -2946,6 +3013,13 @@ class PipelineCommand:
         self.kwargs = kwargs
         self.position = position
         self.result: Union[Any, Exception] = None
+        # When the command was queued through a registered Script, the Script
+        # object so the execution strategy can preload it on its target node
+        # and reload/replay it on NOSCRIPT. None for plain evalsha usage.
+        self.script: Optional["Script"] = None
+        # Reload-and-replay attempts already spent on this command after
+        # NOSCRIPT responses. Bounds the self-healing loop.
+        self.noscript_attempts: int = 0
         # Either record type: a policy resolver serves ``CommandPolicies``, while the
         # fallbacks below reuse the shared ``CommandMetadata`` defaults. Only the two routing
         # policies, which both carry, are ever read.
@@ -2998,6 +3072,16 @@ class ExecutionStrategy(ABC):
         Executes multiple MSET commands according to the provided slot/pairs mapping.
 
         See ClusterPipeline.mset_nonatomic()
+        """
+        pass
+
+    @abstractmethod
+    def register_script_command(
+        self, script: "Script", keys: tuple, script_args: tuple
+    ) -> "ClusterPipeline":
+        """
+        Queue EVALSHA for a registered Script and associate the command with
+        the Script object so the strategy can preload/recover it.
         """
         pass
 
@@ -3085,6 +3169,71 @@ class AbstractStrategy(ExecutionStrategy):
         )
         exception.args = (msg,) + exception.args[1:]
 
+    def register_script_command(
+        self, script: "Script", keys: tuple, script_args: tuple
+    ) -> "ClusterPipeline":
+        """
+        Queue EVALSHA for a registered Script and tag the queued command with
+        the Script object so it can be preloaded and recovered from NOSCRIPT.
+
+        TransactionStrategy overrides this so the command's slot is resolved
+        the same way as every other queued transaction command.
+        """
+        keys = tuple(keys)
+        args = ("EVALSHA", script.sha, len(keys), *keys, *tuple(script_args))
+        command = PipelineCommand(len(self._command_queue), *args)
+        command.script = script
+        self._command_queue.append(command)
+        return self._pipe
+
+    def _scripts_in_commands(self, commands: List["PipelineCommand"]) -> Dict[str, Any]:
+        """Map sha -> Script for every distinct registered script in commands."""
+        scripts: Dict[str, Any] = {}
+        for c in commands:
+            if c.script is not None:
+                scripts.setdefault(c.script.sha, c.script)
+        return scripts
+
+    def _refresh_script_sha_in_queue(self, script: "Script") -> None:
+        """Point queued EVALSHA commands at the (possibly updated) script.sha."""
+        for c in self._command_queue:
+            if c.script is script and c.args[1] != script.sha:
+                c.args = (c.args[0], script.sha, *c.args[2:])
+
+    async def _preload_scripts(
+        self, node: "ClusterNode", connection: "Connection", commands: list
+    ) -> None:
+        """
+        Ensure every registered script referenced by ``commands`` is present in
+        ``node``'s script cache. SCRIPT EXISTS gates the loads, so scripts the
+        node already holds are not sent again; missing loads are deduplicated
+        across concurrent pipelines. Must run before the commands are sent.
+        """
+        scripts = self._scripts_in_commands(commands)
+        if not scripts:
+            return
+        await connection.send_command("SCRIPT EXISTS", *scripts.keys())
+        try:
+            exists = await node.parse_response(connection, "SCRIPT EXISTS")
+        except (ConnectionError, TimeoutError, OSError, ClusterDownError):
+            raise
+        except Exception as e:
+            raise RedisClusterException(
+                f"Unable to check script cache on node {node.name}: {e}"
+            ) from e
+        missing = [
+            script for script, present in zip(scripts.values(), exists) if not present
+        ]
+        if missing:
+            await asyncio.gather(
+                *(
+                    self._pipe.cluster_client.ensure_script_loaded(node, script)
+                    for script in missing
+                )
+            )
+            for script in missing:
+                self._refresh_script_sha_in_queue(script)
+
     @abstractmethod
     def mset_nonatomic(
         self, mapping: Mapping[AnyKeyT, EncodableT]
@@ -3126,6 +3275,10 @@ class AbstractStrategy(ExecutionStrategy):
 
 
 class PipelineStrategy(AbstractStrategy):
+    # Max times a single queued script command is reloaded and replayed after
+    # a NOSCRIPT response before the original NOSCRIPT error is raised.
+    NOSCRIPT_RETRY_LIMIT = 1
+
     def __init__(self, pipe: ClusterPipeline) -> None:
         super().__init__(pipe)
 
@@ -3217,6 +3370,15 @@ class PipelineStrategy(AbstractStrategy):
                 nodes[node.name] = (node, [])
             nodes[node.name][1].append(cmd)
 
+        # Preload registered scripts on their target nodes only, concurrently
+        # with the other nodes, before any queued command is written.
+        await asyncio.gather(
+            *(
+                self._preload_node_scripts(node, commands)
+                for node, commands in nodes.values()
+            )
+        )
+
         # Start timing for observability
         start_time = time.monotonic()
 
@@ -3247,6 +3409,10 @@ class PipelineStrategy(AbstractStrategy):
             )
 
         if any(errors):
+            # Reload and replay script commands that came back NOSCRIPT, while
+            # keeping their positions in the result list.
+            await self._recover_noscript_errors(nodes, todo, client)
+
             if allow_redirections:
                 # send each errored command individually
                 for cmd in todo:
@@ -3291,6 +3457,63 @@ class PipelineStrategy(AbstractStrategy):
                             break
 
         return [cmd.result for cmd in stack]
+
+    async def _preload_node_scripts(
+        self, node: "ClusterNode", commands: List["PipelineCommand"]
+    ) -> None:
+        """Preload the commands' registered scripts on one node, if any."""
+        if not any(cmd.script is not None for cmd in commands):
+            return
+        connection = node.acquire_connection()
+        try:
+            await node.disconnect_if_needed(connection)
+            await self._preload_scripts(node, connection, commands)
+        finally:
+            try:
+                await node.disconnect_if_needed(connection)
+            finally:
+                node.release(connection)
+
+    async def _recover_noscript_errors(
+        self,
+        nodes: Dict[str, Tuple["ClusterNode", List["PipelineCommand"]]],
+        todo: List["PipelineCommand"],
+        client: "RedisCluster",
+    ) -> None:
+        """
+        Reload and replay script commands that returned NOSCRIPT.
+
+        Plain evalsha commands are left untouched, and once the per-command
+        replay budget is spent the original NOSCRIPT error is kept. The replay
+        goes through the cluster client, so a slot migration in between follows
+        the existing MOVED/ASK redirect handling.
+        """
+        for cmd in todo:
+            if not isinstance(cmd.result, NoScriptError) or cmd.script is None:
+                continue
+            if cmd.noscript_attempts >= self.NOSCRIPT_RETRY_LIMIT:
+                continue
+            owner = None
+            for node, commands in nodes.values():
+                if cmd in commands:
+                    owner = node
+                    break
+            if owner is None:
+                continue
+            cmd.noscript_attempts += 1
+            original_error = cmd.result
+            try:
+                await client.ensure_script_loaded(owner, cmd.script)
+                self._refresh_script_sha_in_queue(cmd.script)
+                cmd.result = client._policies_callback_mapping[
+                    cmd.command_policies.response_policy
+                ](await client.execute_command(*cmd.args, **cmd.kwargs))
+            except NoScriptError:
+                # The script is still missing after reload; the spent budget
+                # makes the next pass keep this original NOSCRIPT error.
+                cmd.result = original_error
+            except Exception as e:
+                cmd.result = e
 
     async def reset(self):
         """
@@ -3637,6 +3860,13 @@ class TransactionStrategy(AbstractStrategy):
         if not self._watching:
             await redis_node.disconnect_if_needed(connection)
 
+        # All transaction commands - and therefore their scripts - target this
+        # one transaction node. Load every registered script there BEFORE MULTI
+        # is sent: a NOSCRIPT inside MULTI/EXEC cannot be replayed locally
+        # without aborting the transaction. A load failure raises here, so no
+        # (half) transaction is ever issued.
+        await self._preload_scripts(redis_node, connection, self._command_queue)
+
         # Ensure fieldsets referenced by buffered HIMPORT SETs are prepared on this
         # node's connection before the MULTI/EXEC block (session state, not
         # transactional). All keys share one slot here, so it is a single node.
@@ -3794,6 +4024,21 @@ class TransactionStrategy(AbstractStrategy):
             self._pipeline_slots = set()
             self._transaction_has_keyed_slot = False
             self._executing = False
+
+    def register_script_command(
+        self, script: "Script", keys: tuple, script_args: tuple
+    ) -> "ClusterPipeline":
+        # Route through execute_command() (the synchronous thread bridge on
+        # this strategy) so the EVALSHA's slot is resolved and tracked exactly
+        # like every other transaction command, including the WATCH-phase
+        # immediate path, then tag the queued command with the Script object.
+        keys = tuple(keys)
+        args = ("EVALSHA", script.sha, len(keys), *keys, *tuple(script_args))
+        queue_len = len(self._command_queue)
+        result = self.execute_command(*args)
+        if len(self._command_queue) > queue_len:
+            self._command_queue[-1].script = script
+        return result
 
     def multi(self):
         if self._explicit_transaction:
