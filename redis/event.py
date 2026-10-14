@@ -1,8 +1,11 @@
 import asyncio
+import inspect
+import logging
 import threading
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Dict, List, Optional, Type, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Type, Union
 
 from redis.auth.token import TokenInterface
 from redis.credentials import CredentialProvider, StreamingCredentialProvider
@@ -18,6 +21,8 @@ if TYPE_CHECKING:
         MaintenanceState,
         MaintNotificationsConfig,
     )
+
+logger = logging.getLogger(__name__)
 
 
 class EventListenerInterface(ABC):
@@ -88,6 +93,92 @@ class EventException(Exception):
         super().__init__(exception)
 
 
+class ListenerFailureStrategy(Enum):
+    """
+    How an :class:`EventDispatcher` treats a listener that raises while
+    handling an event. Configured per dispatcher instance.
+
+    ``PROPAGATE``
+        The raised exception propagates to the event source immediately and
+        the remaining listeners for the event are not called. This is the
+        default and preserves the historical behavior.
+
+    ``ISOLATE``
+        The failing listener is skipped, the failure is logged, and every
+        remaining listener still receives the event. The event source never
+        sees the exception.
+
+    ``ISOLATE_AND_AGGREGATE``
+        Every listener is invoked as with ``ISOLATE``, but the failures are
+        collected in listener registration order. Once all listeners have run,
+        they are handed one by one to the configured failure callback, or -
+        when no callback is configured - a single
+        :class:`ListenerFailureError` holding every failure is raised to the
+        event source.
+
+    ``KeyboardInterrupt``, ``SystemExit`` and every other ``BaseException``
+    that is not an ``Exception`` are never isolated under any strategy: they
+    propagate immediately exactly as the listener raised them.
+    """
+
+    PROPAGATE = "propagate"
+    ISOLATE = "isolate"
+    ISOLATE_AND_AGGREGATE = "isolate_and_aggregate"
+
+
+@dataclass(frozen=True)
+class ListenerFailure:
+    """
+    A single listener failure recorded while dispatching an event.
+
+    :param event_type: The type of the event being dispatched.
+    :param listener: The listener instance that raised.
+    :param exception: The original exception raised by the listener.
+    """
+
+    event_type: Type[object]
+    listener: Union[EventListenerInterface, AsyncEventListenerInterface]
+    exception: Exception
+
+    @property
+    def listener_identifier(self) -> str:
+        """A stable, human-readable identifier of the failing listener."""
+        listener_type = type(self.listener)
+        return f"{listener_type.__module__}.{listener_type.__name__}@0x{id(self.listener):x}"
+
+
+class ListenerFailureError(Exception):
+    """
+    Aggregate raised to the event source when every listener has been invoked
+    under :attr:`ListenerFailureStrategy.ISOLATE_AND_AGGREGATE`, one or more
+    listeners failed, and no failure callback is configured.
+
+    :param failures: The :class:`ListenerFailure` records in the same order
+        as the corresponding listeners were registered.
+    """
+
+    def __init__(self, failures: List[ListenerFailure]):
+        self.failures = list(failures)
+        details = "\n".join(
+            f"  {index}. event '{failure.event_type.__name__}', "
+            f"listener '{failure.listener_identifier}', "
+            f"{type(failure.exception).__name__}: {failure.exception}"
+            for index, failure in enumerate(self.failures, start=1)
+        )
+        super().__init__(
+            f"{len(self.failures)} event listener(s) failed while dispatching "
+            f"the event:\n{details}"
+        )
+
+
+#: Receives each recorded failure, in registration order, when the
+#: ``ISOLATE_AND_AGGREGATE`` strategy is used with a callback. May be a regular
+#: function or a coroutine function; ``dispatch_async`` also awaits an
+#: awaitable returned by a regular function. Anything it raises is logged and
+#: never reaches the event source.
+ListenerFailureCallback = Callable[[ListenerFailure], Any]
+
+
 class EventDispatcher(EventDispatcherInterface):
     # TODO: Make dispatcher to accept external mappings.
     def __init__(
@@ -95,9 +186,27 @@ class EventDispatcher(EventDispatcherInterface):
         event_listeners: Optional[
             Dict[Type[object], List[EventListenerInterface]]
         ] = None,
+        failure_strategy: Union[
+            ListenerFailureStrategy, str
+        ] = ListenerFailureStrategy.PROPAGATE,
+        failure_callback: Optional[ListenerFailureCallback] = None,
     ):
         """
         Dispatcher that dispatches events to listeners associated with given event.
+
+        :param event_listeners: Additional listeners registered on construction.
+        :param failure_strategy: How a listener raising an ``Exception`` is
+            treated while dispatching a single event. Defaults to
+            :attr:`ListenerFailureStrategy.PROPAGATE`, which preserves the
+            historical behavior. The strategy is scoped to this dispatcher
+            instance and never affects other dispatchers.
+        :param failure_callback: Used only with
+            :attr:`ListenerFailureStrategy.ISOLATE_AND_AGGREGATE`: invoked once
+            per recorded failure, in listener registration order, after every
+            listener has run. It may be a regular or a coroutine function.
+            When it raises, the error is logged but never reaches the event
+            source. When no callback is configured, the aggregated failures are
+            raised as a :class:`ListenerFailureError` instead.
         """
         self._event_listeners_mapping: Dict[
             Type[object], List[EventListenerInterface]
@@ -125,18 +234,53 @@ class EventDispatcher(EventDispatcherInterface):
         self._lock = threading.RLock()
         self._async_lock = None
 
+        self._failure_strategy = self._coerce_failure_strategy(failure_strategy)
+        self._failure_callback = failure_callback
+
         if event_listeners:
             self.register_listeners(event_listeners)
+
+    @property
+    def failure_strategy(self) -> ListenerFailureStrategy:
+        """The strategy applied when a listener raises during dispatch."""
+        return self._failure_strategy
+
+    @staticmethod
+    def _coerce_failure_strategy(
+        failure_strategy: Union[ListenerFailureStrategy, str],
+    ) -> ListenerFailureStrategy:
+        if isinstance(failure_strategy, ListenerFailureStrategy):
+            return failure_strategy
+        if isinstance(failure_strategy, str):
+            return ListenerFailureStrategy(failure_strategy)
+        raise TypeError(
+            "failure_strategy must be a ListenerFailureStrategy or one of its "
+            f"string values, got {type(failure_strategy).__name__}"
+        )
 
     def dispatch(self, event: object):
         # Snapshot listeners under the lock, then release it before invoking
         # them. Holding the lock across listener execution would turn any
         # listener that calls register_listeners / unregister_listeners /
-        # dispatch back into the dispatcher into a deadlock.
+        # dispatch back into the dispatcher into a deadlock. The snapshot also
+        # makes an in-flight dispatch immune to listeners mutating the
+        # registration of the event being dispatched.
         with self._lock:
             listeners = list(self._event_listeners_mapping.get(type(event), []))
+        # Allocated lazily: connection release is a hot path and dispatch
+        # succeeds without any failure in the common case.
+        failures: Optional[List[ListenerFailure]] = None
         for listener in listeners:
-            listener.listen(event)
+            try:
+                listener.listen(event)
+            except Exception as exception:
+                if self._failure_strategy is ListenerFailureStrategy.PROPAGATE:
+                    raise
+                if failures is None:
+                    failures = []
+                failures.append(self._record_failure(event, listener, exception))
+        if failures is not None:
+            self._report_failures(failures)
 
     async def dispatch_async(self, event: object):
         if self._async_lock is None:
@@ -147,8 +291,111 @@ class EventDispatcher(EventDispatcherInterface):
         # for dispatch_async re-entry from within a listener.
         async with self._async_lock:
             listeners = list(self._event_listeners_mapping.get(type(event), []))
+        # Allocated lazily, see the note in dispatch().
+        failures: Optional[List[ListenerFailure]] = None
         for listener in listeners:
-            await listener.listen(event)
+            try:
+                # Listeners may freely be either coroutine functions or plain
+                # functions. A plain function returning an awaitable (an
+                # un-awaited coroutine/future) is awaited as well, so both
+                # kinds of mixing work; a plain ``None`` return needs no await.
+                outcome = listener.listen(event)
+                if inspect.isawaitable(outcome):
+                    await outcome
+            except Exception as exception:
+                if self._failure_strategy is ListenerFailureStrategy.PROPAGATE:
+                    raise
+                if failures is None:
+                    failures = []
+                failures.append(self._record_failure(event, listener, exception))
+        if failures is not None:
+            await self._report_failures_async(failures)
+
+    def _record_failure(
+        self,
+        event: object,
+        listener: Union[EventListenerInterface, AsyncEventListenerInterface],
+        exception: Exception,
+    ) -> ListenerFailure:
+        failure = ListenerFailure(type(event), listener, exception)
+        self._log_isolated_failure(failure)
+        return failure
+
+    def _log_isolated_failure(self, failure: ListenerFailure) -> None:
+        # A failure that does not reach the event source must never vanish
+        # silently. Failures of the listeners the library registers itself
+        # are logged at error level with their traceback.
+        if isinstance(failure.listener, _BUILTIN_LISTENER_CLASSES):
+            logger.error(
+                "Built-in event listener '%s' failed handling event '%s'; the "
+                "failure is isolated by the '%s' strategy and will not be "
+                "raised to the event source.",
+                failure.listener_identifier,
+                failure.event_type.__name__,
+                self._failure_strategy.value,
+                exc_info=failure.exception,
+            )
+        else:
+            logger.warning(
+                "Event listener '%s' failed handling event '%s'; the failure "
+                "is isolated by the '%s' strategy and will not be raised to "
+                "the event source.",
+                failure.listener_identifier,
+                failure.event_type.__name__,
+                self._failure_strategy.value,
+                exc_info=failure.exception,
+            )
+
+    def _report_failures(self, failures: List[ListenerFailure]) -> None:
+        if not failures:
+            return
+        if self._failure_strategy is not ListenerFailureStrategy.ISOLATE_AND_AGGREGATE:
+            return
+        if self._failure_callback is None:
+            raise ListenerFailureError(failures)
+        for failure in failures:
+            try:
+                outcome = self._failure_callback(failure)
+            except Exception:
+                logger.exception(
+                    "Event listener failure callback raised while handling a "
+                    "failure of listener '%s'; the error is suppressed and "
+                    "cannot affect the event source.",
+                    failure.listener_identifier,
+                )
+                continue
+            if inspect.isawaitable(outcome):
+                # A synchronous dispatch has no event loop to run the
+                # callback on; close a bare coroutine so it is not reported
+                # as never awaited instead of failing silently.
+                if inspect.iscoroutine(outcome):
+                    outcome.close()
+                logger.warning(
+                    "Event listener failure callback returned an awaitable "
+                    "from the synchronous dispatch path for listener '%s'; "
+                    "it cannot be awaited and is ignored.",
+                    failure.listener_identifier,
+                )
+
+    async def _report_failures_async(self, failures: List[ListenerFailure]) -> None:
+        if not failures:
+            return
+        if self._failure_strategy is not ListenerFailureStrategy.ISOLATE_AND_AGGREGATE:
+            return
+        if self._failure_callback is None:
+            raise ListenerFailureError(failures)
+        for failure in failures:
+            try:
+                outcome = self._failure_callback(failure)
+                if inspect.isawaitable(outcome):
+                    await outcome
+            except Exception:
+                logger.exception(
+                    "Event listener failure callback raised while handling a "
+                    "failure of listener '%s'; the error is suppressed and "
+                    "cannot affect the event source.",
+                    failure.listener_identifier,
+                )
 
     def register_listeners(
         self,
@@ -159,15 +406,15 @@ class EventDispatcher(EventDispatcherInterface):
     ):
         with self._lock:
             for event_type in mappings:
-                if event_type in self._event_listeners_mapping:
-                    self._event_listeners_mapping[event_type] = list(
-                        set(
-                            self._event_listeners_mapping[event_type]
-                            + mappings[event_type]
-                        )
-                    )
-                else:
-                    self._event_listeners_mapping[event_type] = mappings[event_type]
+                current = self._event_listeners_mapping.get(event_type, [])
+                # De-duplicate by identity (matching unregister_listeners)
+                # while preserving registration order, so aggregated failures
+                # surface deterministically in registration order.
+                merged = list(current)
+                for listener in mappings[event_type]:
+                    if all(listener is not existing for existing in merged):
+                        merged.append(listener)
+                self._event_listeners_mapping[event_type] = merged
 
     def unregister_listeners(
         self,
@@ -636,3 +883,18 @@ class InitializeConnectionCountObservability(EventListenerInterface):
 
         # Register pools for connection count observability.
         register_pools_connection_count(event.connection_pools)
+
+
+#: Listener classes the library itself registers in the default mapping (and
+#: other built-in listeners shipped with the library). Their isolated failures
+#: are logged explicitly so a misconfigured credential provider or a failing
+#: re-authentication stays visible even when the event source is shielded.
+_BUILTIN_LISTENER_CLASSES = (
+    ReAuthConnectionListener,
+    AsyncReAuthConnectionListener,
+    RegisterReAuthForPooledConnections,
+    RegisterReAuthForSingleConnection,
+    RegisterReAuthForPubSub,
+    RegisterReAuthForAsyncClusterNodes,
+    InitializeConnectionCountObservability,
+)
