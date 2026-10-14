@@ -32,6 +32,33 @@ class TimeoutError(RedisError):
         self.error_type = ExceptionType.NETWORK
 
 
+class RetryTimeoutError(RedisError):
+    """
+    Raised when a retry session ends because its configured total time budget
+    elapsed before another attempt could be made.
+
+    Unlike exhaustion by retry count, which re-raises the last error directly,
+    a deadline hit raises this exception so the two termination causes can be
+    distinguished.
+
+    Attributes
+    ----------
+    attempts:
+        Number of attempts made before the session was terminated.
+    elapsed:
+        Time in seconds elapsed since the first attempt of the session.
+    last_error:
+        The last error raised by an attempt. It is also available as the
+        exception cause (``__cause__``).
+    """
+
+    def __init__(self, attempts: int, elapsed: float, last_error: Exception, *args):
+        self.attempts = attempts
+        self.elapsed = elapsed
+        self.last_error = last_error
+        super().__init__(*args)
+
+
 class AuthenticationError(ConnectionError):
     def __init__(self, *args, status_code: str | None = None):
         super().__init__(*args, status_code=status_code)

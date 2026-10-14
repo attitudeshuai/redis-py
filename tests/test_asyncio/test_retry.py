@@ -1,17 +1,27 @@
+import asyncio
+import copy
+import time
 import warnings
 from threading import Lock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from redis.asyncio import Redis, RedisCluster
+from redis.asyncio.cluster import TransactionStrategy
 from redis.asyncio.connection import (
     Connection,
     ConnectionPool,
     UnixDomainSocketConnection,
 )
-from redis.asyncio.retry import Retry
-from redis.backoff import AbstractBackoff, ExponentialBackoff, NoBackoff
-from redis.exceptions import ConnectionError, TimeoutError
-from redis.retry import AbstractRetry
+from redis.asyncio.retry import Retry, _to_async_retry
+from redis.backoff import (
+    AbstractBackoff,
+    ConstantBackoff,
+    ExponentialBackoff,
+    NoBackoff,
+)
+from redis.exceptions import ConnectionError, RetryTimeoutError, TimeoutError
+from redis.retry import ON_FAILURE_RAISE, AbstractRetry
 from redis.retry import Retry as SyncRetry
 
 
@@ -317,6 +327,280 @@ class TestRetry:
         assert self.actual_failures == 5
 
 
+@pytest.mark.fixed_client
+class TestAsyncRetryTotalTimeout:
+    "Total timeout semantics for the asynchronous Retry"
+
+    def setup_method(self, test_method):
+        self.attempts = 0
+
+    async def _do_fail_fast(self):
+        self.attempts += 1
+        raise ConnectionError()
+
+    def _do_fail_slow(self, delay):
+        async def do():
+            self.attempts += 1
+            await asyncio.sleep(delay)
+            raise ConnectionError()
+
+        return do
+
+    async def _fail(self, error):
+        pass
+
+    @pytest.mark.asyncio
+    async def test_deadline_in_sleep_wakes_up_early(self):
+        # the backoff alone would sleep for 10 seconds per failure
+        retry = Retry(ConstantBackoff(10), 100, total_timeout=0.1)
+        start = time.monotonic()
+        with pytest.raises(RetryTimeoutError) as exc_info:
+            await retry.call_with_retry(self._do_fail_fast, self._fail)
+        elapsed = time.monotonic() - start
+
+        assert elapsed < 1.0
+        error = exc_info.value
+        assert error.attempts == 1
+        assert error.elapsed >= 0.1 - 0.05
+        assert isinstance(error.last_error, ConnectionError)
+        assert error.__cause__ is error.last_error
+        assert self.attempts == 1
+
+    @pytest.mark.asyncio
+    async def test_deadline_stops_further_attempts(self):
+        retry = Retry(NoBackoff(), 10_000, total_timeout=0.15)
+        start = time.monotonic()
+        with pytest.raises(RetryTimeoutError) as exc_info:
+            await retry.call_with_retry(self._do_fail_slow(0.02), self._fail)
+        elapsed = time.monotonic() - start
+
+        error = exc_info.value
+        assert 2 <= error.attempts <= 9
+        assert error.elapsed >= 0.15 - 0.05
+        assert elapsed < 1.0
+        assert self.attempts == error.attempts
+
+    @pytest.mark.asyncio
+    async def test_count_exhaustion_is_distinguishable_from_timeout(self):
+        retry = Retry(NoBackoff(), 2, total_timeout=10)
+        with pytest.raises(ConnectionError):
+            await retry.call_with_retry(self._do_fail_fast, self._fail)
+        assert self.attempts == 3
+
+    @pytest.mark.asyncio
+    async def test_infinite_retries_are_bounded_by_the_deadline(self):
+        retry = Retry(NoBackoff(), -1, total_timeout=0.05)
+        with pytest.raises(RetryTimeoutError) as exc_info:
+            await retry.call_with_retry(self._do_fail_fast, self._fail)
+        assert exc_info.value.attempts >= 1
+
+    @pytest.mark.asyncio
+    async def test_timing_and_sleep_do_not_block_the_event_loop(self):
+        ticks = []
+
+        async def ticker():
+            while True:
+                await asyncio.sleep(0.02)
+                ticks.append(time.monotonic())
+
+        ticker_task = asyncio.create_task(ticker())
+        try:
+            retry = Retry(ConstantBackoff(10), 100, total_timeout=0.1)
+            with pytest.raises(RetryTimeoutError):
+                await retry.call_with_retry(self._do_fail_fast, self._fail)
+        finally:
+            ticker_task.cancel()
+
+        # the 0.1s deadline sleep yielded control to the event loop repeatedly
+        assert len(ticks) >= 3
+
+    @pytest.mark.asyncio
+    async def test_backoff_is_not_consulted_when_deadline_terminates(self):
+        backoff = BackoffMock()
+        retry = Retry(backoff, 100, total_timeout=0.01)
+        with pytest.raises(RetryTimeoutError):
+            await retry.call_with_retry(self._do_fail_slow(0.05), self._fail)
+        assert backoff.calls == 0
+        assert backoff.reset_calls == 1
+
+
+@pytest.mark.fixed_client
+class TestAsyncRetryOnFailureCallback:
+    "Per-failure callback semantics for the asynchronous Retry"
+
+    def setup_method(self, test_method):
+        self.attempts = 0
+
+    async def _do(self):
+        self.attempts += 1
+        raise ConnectionError(f"failure {self.attempts}")
+
+    async def _fail(self, error):
+        pass
+
+    @pytest.mark.asyncio
+    async def test_sync_callback_is_supported(self):
+        events = []
+
+        retry = Retry(
+            ConstantBackoff(0.001),
+            2,
+            on_failure=lambda attempt, elapsed, backoff, error: events.append(
+                (attempt, backoff)
+            ),
+        )
+        with pytest.raises(ConnectionError):
+            await retry.call_with_retry(self._do, self._fail)
+
+        assert [event[0] for event in events] == [1, 2, 3]
+        assert events[0][1] == pytest.approx(0.001)
+        assert events[-1][1] == 0.0
+        assert isinstance(events[-1][1], float)
+
+    @pytest.mark.asyncio
+    async def test_async_callback_is_supported(self):
+        events = []
+
+        async def on_failure(attempt, elapsed, backoff, error):
+            await asyncio.sleep(0)
+            events.append((attempt, type(error)))
+
+        retry = Retry(NoBackoff(), 2, on_failure=on_failure)
+        with pytest.raises(ConnectionError):
+            await retry.call_with_retry(self._do, self._fail)
+
+        assert [event[0] for event in events] == [1, 2, 3]
+        assert all(event[1] is ConnectionError for event in events)
+
+    @pytest.mark.asyncio
+    async def test_callback_error_is_logged_and_retry_continues(self, caplog):
+        def on_failure(attempt, elapsed, backoff, error):
+            raise RuntimeError("boom in callback")
+
+        retry = Retry(NoBackoff(), 2, on_failure=on_failure)
+        with caplog.at_level("WARNING", logger="redis.asyncio.retry"):
+            with pytest.raises(ConnectionError):
+                await retry.call_with_retry(self._do, self._fail)
+
+        assert self.attempts == 3
+        assert any(
+            "on_failure callback raised" in record.message for record in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_callback_error_can_abort_the_session(self):
+        async def on_failure(attempt, elapsed, backoff, error):
+            raise RuntimeError("boom in callback")
+
+        retry = Retry(
+            NoBackoff(),
+            2,
+            on_failure=on_failure,
+            on_failure_error=ON_FAILURE_RAISE,
+        )
+        with pytest.raises(RuntimeError, match="boom in callback"):
+            await retry.call_with_retry(self._do, self._fail)
+        assert self.attempts == 1
+
+    @pytest.mark.asyncio
+    async def test_nested_session_inside_callback_has_no_state_crosstalk(self):
+        outer_attempt_numbers = []
+        nested_outcomes = []
+
+        async def outer_do():
+            raise ConnectionError("outer")
+
+        async def on_failure(attempt, elapsed, backoff, error):
+            outer_attempt_numbers.append(attempt)
+            # simulate the callback issuing another command through the very
+            # same client, i.e. re-entering the same Retry policy object
+            nested_outcomes.append(
+                await retry.call_with_retry(
+                    lambda: _return_nested_ok(), lambda nested: None
+                )
+            )
+
+        async def _return_nested_ok():
+            return "nested-ok"
+
+        retry = Retry(NoBackoff(), 3, total_timeout=10, on_failure=on_failure)
+        with pytest.raises(ConnectionError):
+            await retry.call_with_retry(outer_do, self._fail)
+
+        assert outer_attempt_numbers == [1, 2, 3, 4]
+        assert nested_outcomes == ["nested-ok"] * 4
+
+
+@pytest.mark.fixed_client
+class TestAsyncRetryConfigurationPropagation:
+    "New options survive sync -> async conversion and cluster construction"
+
+    def test_sync_to_async_conversion_preserves_new_options(self):
+        def callback(*args):
+            return None
+
+        sync_retry = SyncRetry(
+            NoBackoff(),
+            2,
+            total_timeout=2.5,
+            on_failure=callback,
+            on_failure_error=ON_FAILURE_RAISE,
+        )
+        with pytest.warns(UserWarning, match="synchronous redis.retry.Retry"):
+            converted = _to_async_retry(sync_retry)
+
+        assert isinstance(converted, Retry)
+        assert converted._total_timeout == 2.5
+        assert converted._on_failure is callback
+        assert converted._on_failure_error == ON_FAILURE_RAISE
+
+    def test_cluster_keeps_total_timeout_configuration(self):
+        retry = Retry(NoBackoff(), 2, total_timeout=3.0)
+        client = RedisCluster(host="127.0.0.1", port=6379, retry=retry)
+        assert client.retry._total_timeout == 3.0
+
+    @pytest.mark.asyncio
+    async def test_cluster_transaction_entry_honors_total_timeout(self):
+        # exercise the async cluster transaction retry entry (no server needed)
+        strategy = TransactionStrategy.__new__(TransactionStrategy)
+        strategy._retry = Retry(ConstantBackoff(10), 100, total_timeout=0.1)
+
+        async def fake_reinitialize(error, failure_count):
+            return None
+
+        strategy._reinitialize_on_error = fake_reinitialize
+        attempts = []
+
+        async def fake_execute_transaction(stack, raise_on_error):
+            attempts.append(1)
+            raise ConnectionError()
+
+        strategy._execute_transaction = fake_execute_transaction
+        start = time.monotonic()
+        with pytest.raises(RetryTimeoutError) as exc_info:
+            await strategy._execute_transaction_with_retries([], True)
+
+        assert time.monotonic() - start < 1.0
+        assert sum(attempts) == 1
+        assert exc_info.value.attempts == 1
+
+    def test_cluster_pipeline_retry_copy_preserves_new_options(self):
+        def callback(*args):
+            return None
+
+        retry = Retry(
+            NoBackoff(),
+            2,
+            total_timeout=2.5,
+            on_failure=callback,
+            on_failure_error=ON_FAILURE_RAISE,
+        )
+        copied = copy.copy(retry)
+        assert copied._total_timeout == 2.5
+        assert copied._on_failure is callback
+        assert copied._on_failure_error == ON_FAILURE_RAISE
+
+
 class TestRedisClientRetry:
     "Test the Redis client behavior with retries"
 
@@ -337,3 +621,64 @@ class TestRedisClientRetry:
         assert new_conn.retry._retries == new_retry_policy._retries
         await r.connection_pool.release(new_conn)
         await r.aclose()
+
+    @pytest.mark.asyncio
+    async def test_client_retry_total_timeout(self, request):
+        url = request.config.getoption("--redis-url")
+        r = await Redis.from_url(
+            url, retry=Retry(ConstantBackoff(5), 100, total_timeout=0.2)
+        )
+        start = time.monotonic()
+        try:
+            with patch.object(
+                Redis, "parse_response", new=AsyncMock(side_effect=TimeoutError())
+            ):
+                with pytest.raises(RetryTimeoutError):
+                    await r.get("foo")
+        finally:
+            elapsed = time.monotonic() - start
+            await r.aclose()
+        assert elapsed < 2
+
+    @pytest.mark.asyncio
+    async def test_client_retry_on_failure_callback(self, request):
+        url = request.config.getoption("--redis-url")
+        events = []
+        r = await Redis.from_url(
+            url,
+            retry=Retry(
+                NoBackoff(),
+                2,
+                on_failure=lambda attempt, elapsed, backoff, error: events.append(
+                    (attempt, type(error))
+                ),
+            ),
+        )
+        with patch.object(
+            Redis, "parse_response", new=AsyncMock(side_effect=TimeoutError())
+        ):
+            with pytest.raises(TimeoutError):
+                await r.get("foo")
+        await r.aclose()
+        assert [event[0] for event in events] == [1, 2, 3]
+        assert all(event[1] is TimeoutError for event in events)
+
+    @pytest.mark.asyncio
+    async def test_pipeline_retry_total_timeout(self, request):
+        url = request.config.getoption("--redis-url")
+        r = await Redis.from_url(
+            url, retry=Retry(ConstantBackoff(5), 100, total_timeout=0.2)
+        )
+        start = time.monotonic()
+        try:
+            with patch.object(
+                Redis, "parse_response", new=AsyncMock(side_effect=TimeoutError())
+            ):
+                with pytest.raises(RetryTimeoutError):
+                    pipe = r.pipeline(transaction=False)
+                    pipe.get("foo")
+                    await pipe.execute()
+        finally:
+            elapsed = time.monotonic() - start
+            await r.aclose()
+        assert elapsed < 2

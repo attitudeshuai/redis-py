@@ -44,6 +44,7 @@ from redis.exceptions import (
     RedisClusterException,
     RedisError,
     ResponseError,
+    RetryTimeoutError,
     TimeoutError,
     WatchError,
 )
@@ -109,6 +110,7 @@ __all__ = [
     "RedisClusterException",
     "RedisError",
     "ResponseError",
+    "RetryTimeoutError",
     "Sentinel",
     "SentinelConnectionPool",
     "SentinelManagedConnection",
